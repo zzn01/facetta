@@ -52,9 +52,11 @@ Three pillars:
 | `schema.go` | 135 | `Schema`/`Record`/`Config` definitions and validation, error sentinels, schema fingerprint |
 | `dict.go` | 38 | Bidirectional string ↔ uint32 id dictionary, immutable once published, writers clone first |
 | `snapshot.go` | 424 | Immutable columnar base; full build (`buildFromRecords`) and merge (`mergeView`/`zipMerge`) |
-| `view.go` | 218 | `view`/`delta` structures; write path `applyDelta` (copy-on-write) |
+| `view.go` | 227 | `view`/`delta` structures; write path `applyDelta` (copy-on-write) |
 | `store.go` | 193 | `Store` facade: atomic pointer, write lock, `Apply`/`Compact`/`ReplaceAll` |
-| `query.go` | 249 | Query planning (`plan`) and execution (`QueryGroups`), scan budget |
+| `query.go` | 404 | `Cond` (equality + IN), shared planner (`planGroups`), `QueryGroups`, scan budget |
+| `agg.go` | 179 | `Agg`/`AggOp` aggregate selection, `QueryAggs` (zero-alloc) |
+| `groupby.go` | 226 | `QueryGroupBy` hash aggregation into a reusable `GroupedResult` |
 | `compactor.go` | 89 | Optional background compaction policy (when to call `Compact`) |
 | `persist.go` | 272 | Snapshot persistence/loading, versioned binary format + CRC |
 | `stats.go` | 70 | Monitoring counter snapshot |
@@ -156,6 +158,33 @@ must keep it green.
 column is never touched; likewise the whole check is skipped when the base's earliest
 expiry moment is still in the future. Tables that don't use per-row TTL pay zero cost for
 the feature. A query samples `now` exactly once, so results are internally consistent.
+
+### The Other Query Entry Points: QueryAggs and QueryGroupBy
+
+All three entry points share the pipeline above through `planGroups`
+(`query.go`): plan every group, union the candidate ranges, enforce the scan
+budget. Only the per-row action differs — `QueryGroups` sums every metric,
+`QueryAggs` (`agg.go`) folds the requested aggregate columns into a
+fixed-size stack accumulator (still zero-alloc; Min/Max initialize from the
+first matched row, Count/Avg derive from a shared row counter), and
+`QueryGroupBy` (`groupby.go`) hash-aggregates into a reusable
+`GroupedResult`: the group key is the packed id tuple of the by dims (ids
+identify strings uniquely within one view, across base and delta), map
+lookups use the non-allocating `m[string(bytes)]` form, groups are created
+from their first row (no sentinel init), and the output is sorted by key
+strings for determinism. Its allocations are O(result groups) per call and
+amortize on a reused result — the one documented exception to the
+zero-allocation rule.
+
+IN conditions (`Cond.In`) are resolved into a per-query id pool (`queryIns`)
+rather than into `groupPlan`, and checked by `matchIns` at the call sites
+rather than inside `matchBase`/`matchDelta`. Both placements are
+deliberate hot-path protection, measured before merging: a per-plan id array
+inflates the plans' stack scratch by an order of magnitude (all of which is
+zero-initialized on every query), and folding the IN check into the matchers
+pushes them past the compiler's inline budget — either costs double-digit
+percentages on the indexed query. IN-free queries pass a nil pool and pay
+one never-taken branch per matched row.
 
 ## Write Path: Apply's Copy-on-Write (`view.go:113`)
 

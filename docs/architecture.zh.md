@@ -42,9 +42,11 @@
 | `schema.go` | 135 | `Schema`/`Record`/`Config` 定义与校验,错误哨兵,schema 指纹 |
 | `dict.go` | 38 | 字符串 ↔ uint32 id 双向字典,发布后不可变,写者先 clone |
 | `snapshot.go` | 424 | 不可变列式基底;全量构建(`buildFromRecords`)与归并(`mergeView`/`zipMerge`) |
-| `view.go` | 218 | `view`/`delta` 结构;写路径 `applyDelta`(copy-on-write) |
+| `view.go` | 227 | `view`/`delta` 结构;写路径 `applyDelta`(copy-on-write) |
 | `store.go` | 193 | `Store` 门面:原子指针、写锁、`Apply`/`Compact`/`ReplaceAll` |
-| `query.go` | 249 | 查询规划(`plan`)与执行(`QueryGroups`),扫描预算 |
+| `query.go` | 404 | `Cond`(等值 + IN),共享规划器(`planGroups`),`QueryGroups`,扫描预算 |
+| `agg.go` | 179 | `Agg`/`AggOp` 聚合选择,`QueryAggs`(零分配) |
+| `groupby.go` | 226 | `QueryGroupBy` 哈希聚合,产出可复用的 `GroupedResult` |
 | `compactor.go` | 89 | 可选后台压实策略(何时调 `Compact`) |
 | `persist.go` | 272 | 快照落盘/加载,版本化二进制格式 + CRC |
 | `stats.go` | 70 | 监控计数器快照 |
@@ -128,6 +130,25 @@ view.Load()                          ── 唯一一次原子读,之后全程�
 **过期检查也是按需的**:视图里没有任何可过期行(`base.minExpire==0 && !delta.hasExpiry`)
 时,连 `now` 都不采样,expire 列一次都不碰;基底最早过期时刻还在未来时同样整体跳过。
 不用行级 TTL 的表为该特性付出的代价是零。一次查询只采样一个 `now`,结果内部一致。
+
+### 另外两个查询入口:QueryAggs 与 QueryGroupBy
+
+三个入口经由 `planGroups`(`query.go`)共享上面的整条流水线:逐组规划、候选区间
+取并集、执行扫描预算。区别只在每行的动作 —— `QueryGroups` 对全部指标求和;
+`QueryAggs`(`agg.go`)把请求的聚合列折叠进定长的栈上累加器(仍然零分配;
+Min/Max 从首个命中行初始化,Count/Avg 派生自共享的行计数器);`QueryGroupBy`
+(`groupby.go`)哈希聚合进可复用的 `GroupedResult`:分组键是 by 维度的打包 id
+元组(在同一 view 内、跨 base 与 delta,id 唯一标识字符串),map 查找用不分配的
+`m[string(bytes)]` 形式,分组由其首行直接创建(无需哨兵初始化),输出按键字符串
+排序以保证确定性。它的分配是每次调用 O(结果组数),并在复用的结果上摊销 ——
+这是零分配规则唯一的文档化例外。
+
+IN 条件(`Cond.In`)被解析进按查询一份的 id 池(`queryIns`)而不是 `groupPlan`,
+并由调用点的 `matchIns` 检查,而不是放进 `matchBase`/`matchDelta` 内部。两处摆放
+都是刻意的热路径保护,合并前经过实测:按 plan 一份的 id 数组会让 plans 的栈
+scratch 膨胀一个数量级(而它们每次查询都要全量清零初始化);把 IN 检查折进匹配器
+会把它们推出编译器的内联预算 —— 两者都会让索引查询付出两位数百分比的代价。
+不含 IN 的查询传入 nil 池,每个命中行只多付一次永不成立的分支。
 
 ## 写路径:Apply 的 copy-on-write(`view.go:113`)
 

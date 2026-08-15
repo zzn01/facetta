@@ -69,6 +69,55 @@ rebuild) forgets the tuple's `UpdatedAt` watermark, so an out-of-order
 deliberate — remembering every reclaimed tombstone forever would unbound
 memory — and falls in the same drift category `ReplaceAll` repairs.
 
+## Aggregates, IN conditions and GROUP BY
+
+Beyond the sum-everything `Query`/`QueryGroups`, three richer query forms
+share the same planner, union semantics (each row counted once across
+groups) and expiry visibility:
+
+```go
+// Selected aggregates, still zero-alloc: one output per Agg column.
+sums, err := store.QueryAggs(buf, []facetta.Agg{
+    {Op: facetta.AggCount},                       // matched row count
+    {Metric: "impressions", Op: facetta.AggSum},
+    {Metric: "clicks", Op: facetta.AggAvg},       // NaN when nothing matches
+}, groups)
+
+// IN condition: dimension equals ANY listed value.
+groups := [][]facetta.Cond{{
+    {Dim: "source", Value: "src7"},
+    {Dim: "os", In: []string{"ios", "android"}},
+}}
+
+// GROUP BY: aggregates per distinct combination of the by dims.
+var res facetta.GroupedResult // reuse across calls
+err = store.QueryGroupBy(&res, []string{"country", "os"}, aggs, groups)
+for i := 0; i < res.N; i++ {
+    key := res.Keys[i*2 : (i+1)*2]   // ["US", "ios"], sorted, deterministic
+    row := res.Aggs[i*len(aggs) : (i+1)*len(aggs)]
+    _ = key; _ = row
+}
+```
+
+Semantics and limits:
+
+- **`QueryAggs`** supports `AggSum`, `AggCount`, `AggMin`, `AggMax`, `AggAvg`
+  (up to 16 columns). Over zero matched rows Sum/Count are 0 and Min/Max/Avg
+  are **NaN** (the float64 stand-in for SQL NULL). Zero heap allocations,
+  same as `QueryGroups`.
+- **`Cond.In`** filters rows during the scan but does **not** contribute to
+  index-prefix planning: a group whose leading index dims carry only IN
+  conditions degrades to a full scan (fail-fast guarded by `MaxScanRows`).
+  For indexed multi-value queries use one group per value instead. Caps: 16
+  values per condition, 16 IN conditions / 128 resolved values per query.
+- **`QueryGroupBy`** writes into a reusable `GroupedResult` (flat row-major
+  `Keys`/`Aggs`, groups sorted lexicographically — deterministic output).
+  It is the one query entry point with a relaxed allocation contract:
+  per call it allocates **O(result groups)** (map-key interning and sort
+  scratch, never O(scanned rows)); slices and map buckets amortize across
+  calls on a reused result. Key strings alias the store's immutable
+  dictionaries — no copies. The scan budget applies unchanged.
+
 ## Configuration
 
 ### Store Config
@@ -206,6 +255,8 @@ Measured on an Intel Core i9-9880H (2.30GHz), `go test -bench . -benchmem -run x
 | `BenchmarkQueryFullScan1M` (1M rows, 1 group on a non-index dim) | ~5.1-5.6 ms/op | 0 B/op | 0 allocs/op |
 | `BenchmarkQueryMultiGroup1M` (1M rows, 8 indexed groups unioned) | ~1.8 µs/op | 0 B/op | 0 allocs/op |
 | `BenchmarkQueryWithDelta1M` (1M base + 10k delta, 2 indexed groups) | ~47 µs/op | 0 B/op | 0 allocs/op |
+| `BenchmarkQueryAggsIndexed1M` (as the indexed query, 4 aggregate columns) † | ~1.7× the indexed sum query | 0 B/op | 0 allocs/op |
+| `BenchmarkGroupByIndexed1M` (~20k-row indexed range grouped by an 8-value dim, reused `GroupedResult`) † | ~1.0 ms/op | ~89 B/op | 10 allocs/op |
 | `BenchmarkApply1K` (1000-record batch onto 1M rows) | ~4 ms/op averaged as the resident delta approaches the 50k compaction threshold (Apply copies the delta columns; the tuple index is map-cloned, not rebuilt) | ~3.9 MB/op | ~1.1k allocs/op |
 | `BenchmarkApplySmallOnLargeDelta` (10-record batch onto a ~100k-row delta) | ~1.9 ms/op (the O(DeltaRows) column copy dominates) | ~8.9 MB/op | ~280 allocs/op |
 | `BenchmarkReplaceAll1M` (full reconcile build, 1M records) | ~560-600 ms/op | ~202 MB/op | ~490 allocs/op |
@@ -213,6 +264,8 @@ Measured on an Intel Core i9-9880H (2.30GHz), `go test -bench . -benchmem -run x
 | `BenchmarkLoadSnapshot1M` (1M rows, fresh `Store` per iteration) | ~52 ms/op | ~119 MB/op | ~32.7k allocs/op |
 | `BenchmarkCompact1M` (1M base + 1k delta merged per iteration, with dictionary compaction, `-benchtime=5x`) | ~88 ms/op | ~67 MB/op | ~424 allocs/op |
 | `BenchmarkCompactIDStable1M` (as above on the gated id-stable path, `DictCompactInterval` open) | ~52 ms/op | ~60 MB/op | ~34 allocs/op |
+
+† measured in a later session whose machine ran globally slower (same-day A/B put the pre-existing rows at their old relative levels, unregressed within ±3% noise); the ratio and the allocation counts are the durable numbers.
 
 `BenchmarkQueryFullScan1M` shows the degraded full-scan path costs roughly 14,000x an indexed lookup (~5.3 ms vs ~370 ns); `BenchmarkQueryWithDelta1M` shows a 10k-row delta overlay adds ~120x over the delta-free indexed query (~47 µs vs ~370 ns) from its linear scan. Queries against views with no expirable rows skip all per-row expiry checks (and the clock sample), so tables that never set `ExpireAt` pay nothing for the per-record TTL feature. Base rows are also exempt from per-row checks while the earliest base expiry is still in the future — the expire column is only touched once a row could actually be expired.
 

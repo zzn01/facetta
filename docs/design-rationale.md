@@ -153,6 +153,43 @@ Two details are deliberate:
 Budget refusal is an availability feature, not a semantics change: the oracle
 has no budget concept, and equivalence tests run with the budget disabled.
 
+## Aggregates, IN, and GROUP BY: extending without unfreezing
+
+The original query shape (equality filters, sum every metric) is a frozen
+contract — its semantics, zero-allocation guarantee, and measured latency must
+survive every later feature. The richer query forms were added under that
+constraint, which drove four decisions:
+
+- **New capability, new entry points.** `QueryAggs` and `QueryGroupBy` are
+  separate methods sharing one planner, instead of options on `QueryGroups` —
+  an options struct would put branches and larger scratch on the frozen path.
+  The one addition to the existing surface, `Cond.In`, is engineered to cost
+  IN-free queries nothing measurable: its resolved ids live in a per-query
+  pool handed over as a nil pointer when no IN is present (a per-plan array
+  would grow every query's zero-initialized stack scratch tenfold), and the
+  membership check stays out of the row matchers because even a call to it
+  pushes them past the compiler's inline budget — both variants were measured
+  at double-digit percentage regressions and rejected.
+- **NaN is the empty aggregate.** Min/Max/Avg over zero matched rows return
+  NaN — float64's stand-in for SQL NULL. Any numeric sentinel (0, ±Inf) is a
+  legal data value; an extra "valid" flag would change the output shape. The
+  oracle produces the same NaN, and equivalence tests compare NaN-aware.
+- **IN filters, it does not plan.** IN conditions participate in row matching
+  but not in index-prefix planning: expanding a prefix dim's IN values into
+  multiple candidate ranges multiplies interval bookkeeping for a capability
+  the group-union API already expresses (one group per value). A group whose
+  leading dims carry only INs degrades to a scan and lands in the existing
+  `MaxScanRows` safety net.
+- **GROUP BY relaxes the allocation rule — explicitly, and only there.**
+  Group-by output is inherently variable-size, so "zero allocations" is
+  unattainable; the honest contract is O(result groups) allocations per call
+  (map-key interning, sort scratch), never O(scanned rows), amortized on a
+  reused `GroupedResult`. Hash aggregation over packed id tuples was chosen
+  over a streaming sort-order variant because the delta overlay is unsorted
+  anyway — one code path that always works beats two paths where one only
+  sometimes applies. Output is sorted by key strings so results are
+  deterministic; keys alias the immutable dictionaries rather than copying.
+
 ## Time-gated dictionary compaction
 
 Dictionary ids, once issued, are baked into row data, old views, and disk
