@@ -1,0 +1,6 @@
+docs/superpowers/
+.worktrees/
+.superpowers/
+.claude/settings.local.json
+!.github/
+docs/specs/
