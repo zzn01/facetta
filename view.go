@@ -57,6 +57,15 @@ func (v *view) lookupID(dim int, s string) (uint32, bool) {
 	return 0, false
 }
 
+// dimString resolves a combined-space dim id back to its string: below the
+// base dictionary length it is a base id, above it an extras id.
+func (v *view) dimString(dim int, id uint32) string {
+	if n := uint32(v.base.dicts[dim].len()); id >= n {
+		return v.extras[dim].strs[id-n]
+	}
+	return v.base.dicts[dim].strs[id]
+}
+
 func (v *view) maxUpdated() int64 {
 	if v.delta.maxUpdated > v.base.maxUpdated {
 		return v.delta.maxUpdated

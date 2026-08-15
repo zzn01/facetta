@@ -2,6 +2,7 @@ package facetta
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"testing"
 	"time"
@@ -43,14 +44,39 @@ func TestEquivalenceRandomized(t *testing.T) {
 					nc := rng.Intn(4)
 					for range nc {
 						d := rng.Intn(len(sc.Dims))
-						groups[g] = append(groups[g], Cond{
-							Dim:   sc.Dims[d],
-							Value: fmt.Sprintf("%s%d", sc.Dims[d][:1], rng.Intn(card+1)), // sometimes absent
-						})
+						val := func() string {
+							return fmt.Sprintf("%s%d", sc.Dims[d][:1], rng.Intn(card+1)) // sometimes absent
+						}
+						if rng.Intn(4) == 0 {
+							// ~1 in 4 conditions is an IN set of 1-3 values
+							in := make([]string, 1+rng.Intn(3))
+							for i := range in {
+								in[i] = val()
+							}
+							groups[g] = append(groups[g], Cond{Dim: sc.Dims[d], In: in})
+						} else {
+							groups[g] = append(groups[g], Cond{Dim: sc.Dims[d], Value: val()})
+						}
 					}
 				}
 				return groups
 			}
+			randAggs := func() []Agg {
+				aggs := make([]Agg, 1+rng.Intn(4))
+				for i := range aggs {
+					op := AggOp(rng.Intn(int(AggAvg) + 1))
+					a := Agg{Op: op}
+					if op != AggCount {
+						a.Metric = sc.Metrics[rng.Intn(len(sc.Metrics))]
+					}
+					aggs[i] = a
+				}
+				return aggs
+			}
+			sameNaN := func(a, b float64) bool {
+				return a == b || (math.IsNaN(a) && math.IsNaN(b))
+			}
+			var res GroupedResult // reused across all group-by checks
 			check := func(step string) {
 				t.Helper()
 				for range 20 {
@@ -63,6 +89,42 @@ func TestEquivalenceRandomized(t *testing.T) {
 					for m := range want {
 						if got[m] != want[m] {
 							t.Fatalf("%s: query %v: got %v want %v", step, groups, got, want)
+						}
+					}
+
+					aggs := randAggs()
+					gotA, err := s.QueryAggs(nil, aggs, groups)
+					if err != nil {
+						t.Fatalf("%s: aggs: %v", step, err)
+					}
+					wantA := rt.queryAggs(aggs, groups)
+					for i := range wantA {
+						if !sameNaN(gotA[i], wantA[i]) {
+							t.Fatalf("%s: aggs %v query %v: got %v want %v", step, aggs, groups, gotA, wantA)
+						}
+					}
+
+					by := make([]string, 0, 2)
+					for _, d := range rng.Perm(len(sc.Dims))[:1+rng.Intn(2)] {
+						by = append(by, sc.Dims[d])
+					}
+					if err := s.QueryGroupBy(&res, by, aggs, groups); err != nil {
+						t.Fatalf("%s: group-by: %v", step, err)
+					}
+					gotG := groupedToMap(&res, len(by), len(aggs))
+					wantG := rt.queryGroupBy(by, aggs, groups)
+					if len(gotG) != len(wantG) {
+						t.Fatalf("%s: group-by %v query %v: got %d groups want %d", step, by, groups, len(gotG), len(wantG))
+					}
+					for k, w := range wantG {
+						g, ok := gotG[k]
+						if !ok {
+							t.Fatalf("%s: group-by %v query %v: missing group %q", step, by, groups, k)
+						}
+						for i := range w {
+							if !sameNaN(g[i], w[i]) {
+								t.Fatalf("%s: group-by %v aggs %v query %v: group %q got %v want %v", step, by, aggs, groups, k, g, w)
+							}
 						}
 					}
 				}

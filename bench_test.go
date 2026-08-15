@@ -102,6 +102,48 @@ func BenchmarkQueryMultiGroup1M(b *testing.B) {
 	}
 }
 
+// BenchmarkQueryAggsIndexed1M runs the same indexed 2-group query as
+// BenchmarkQueryIndexed1M through QueryAggs with four aggregate columns.
+func BenchmarkQueryAggsIndexed1M(b *testing.B) {
+	s := benchStore(b, 1_000_000)
+	buf := make([]float64, 0, 4)
+	aggs := []Agg{
+		{Op: AggCount},
+		{Metric: "visits", Op: AggSum},
+		{Metric: "visits", Op: AggMin},
+		{Metric: "revenue", Op: AggAvg},
+	}
+	groups := [][]Cond{
+		{{Dim: "source", Value: "src7"}, {Dim: "account", Value: "acc42"}},
+		{{Dim: "source", Value: "src9"}, {Dim: "account", Value: "acc7"}},
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var err error
+		buf, err = s.QueryAggs(buf, aggs, groups)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkGroupByIndexed1M groups an indexed ~20k-row candidate range
+// (source=src7) by the 8-value os dim, on a reused GroupedResult.
+func BenchmarkGroupByIndexed1M(b *testing.B) {
+	s := benchStore(b, 1_000_000)
+	var res GroupedResult
+	aggs := []Agg{{Op: AggCount}, {Metric: "visits", Op: AggSum}}
+	groups := [][]Cond{{{Dim: "source", Value: "src7"}}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := s.QueryGroupBy(&res, []string{"os"}, aggs, groups); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkQueryWithDelta1M runs the same indexed 2-group query as
 // BenchmarkQueryIndexed1M, but against a store with a ~10k-row delta overlay
 // applied (no Compact), quantifying the delta linear-scan overhead.

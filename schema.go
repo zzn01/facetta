@@ -15,6 +15,7 @@ const (
 	maxDims   = 16
 	maxGroups = 16
 	maxConds  = 16
+	maxInVals = 16
 )
 
 var (

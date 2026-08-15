@@ -1,6 +1,7 @@
 package facetta
 
 import (
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -74,11 +75,164 @@ func (t *refTable) visibleRows() int {
 func (t *refTable) matches(r Record, g []Cond) bool {
 	for _, c := range g {
 		di := t.sc.dimIndex(c.Dim)
-		if di < 0 || r.Dims[di] != c.Value {
+		if di < 0 {
+			return false
+		}
+		if len(c.In) > 0 {
+			ok := false
+			for _, v := range c.In {
+				if r.Dims[di] == v {
+					ok = true
+					break
+				}
+			}
+			if !ok {
+				return false
+			}
+		} else if r.Dims[di] != c.Value {
 			return false
 		}
 	}
 	return true
+}
+
+func (t *refTable) metricIndex(name string) int {
+	for i, m := range t.sc.Metrics {
+		if m == name {
+			return i
+		}
+	}
+	return -1
+}
+
+// queryAggs mirrors Store.QueryAggs: one output per requested aggregate over
+// rows matching ANY group (each row counted once). Min/Max/Avg over zero
+// matched rows are NaN.
+func (t *refTable) queryAggs(aggs []Agg, groups [][]Cond) []float64 {
+	nm := len(t.sc.Metrics)
+	sums := make([]float64, nm)
+	mins := make([]float64, nm)
+	maxs := make([]float64, nm)
+	n := 0
+	for _, r := range t.data {
+		if !t.visible(r) {
+			continue
+		}
+		hit := false
+		for _, g := range groups {
+			if t.matches(r, g) {
+				hit = true
+				break
+			}
+		}
+		if !hit {
+			continue
+		}
+		for m := range nm {
+			v := r.Metrics[m]
+			sums[m] += v
+			if n == 0 || v < mins[m] {
+				mins[m] = v
+			}
+			if n == 0 || v > maxs[m] {
+				maxs[m] = v
+			}
+		}
+		n++
+	}
+	out := make([]float64, len(aggs))
+	for i, a := range aggs {
+		switch a.Op {
+		case AggCount:
+			out[i] = float64(n)
+		case AggSum:
+			out[i] = sums[t.metricIndex(a.Metric)]
+		case AggMin:
+			out[i] = math.NaN()
+			if n > 0 {
+				out[i] = mins[t.metricIndex(a.Metric)]
+			}
+		case AggMax:
+			out[i] = math.NaN()
+			if n > 0 {
+				out[i] = maxs[t.metricIndex(a.Metric)]
+			}
+		case AggAvg:
+			out[i] = math.NaN()
+			if n > 0 {
+				out[i] = sums[t.metricIndex(a.Metric)] / float64(n)
+			}
+		}
+	}
+	return out
+}
+
+// queryGroupBy mirrors Store.QueryGroupBy: the requested aggregates per
+// distinct combination of the by dims, over rows matching ANY group (each row
+// counted once). Map keys are the by values joined with \x1f.
+func (t *refTable) queryGroupBy(by []string, aggs []Agg, groups [][]Cond) map[string][]float64 {
+	nm := len(t.sc.Metrics)
+	type acc struct {
+		sums, mins, maxs []float64
+		n                int
+	}
+	accs := map[string]*acc{}
+	for _, r := range t.data {
+		if !t.visible(r) {
+			continue
+		}
+		hit := false
+		for _, g := range groups {
+			if t.matches(r, g) {
+				hit = true
+				break
+			}
+		}
+		if !hit {
+			continue
+		}
+		parts := make([]string, len(by))
+		for i, d := range by {
+			parts[i] = r.Dims[t.sc.dimIndex(d)]
+		}
+		k := strings.Join(parts, "\x1f")
+		a := accs[k]
+		if a == nil {
+			a = &acc{sums: make([]float64, nm), mins: make([]float64, nm), maxs: make([]float64, nm)}
+			accs[k] = a
+		}
+		for m := range nm {
+			v := r.Metrics[m]
+			a.sums[m] += v
+			if a.n == 0 || v < a.mins[m] {
+				a.mins[m] = v
+			}
+			if a.n == 0 || v > a.maxs[m] {
+				a.maxs[m] = v
+			}
+		}
+		a.n++
+	}
+	out := map[string][]float64{}
+	for k, a := range accs {
+		row := make([]float64, len(aggs))
+		for i, g := range aggs {
+			switch g.Op {
+			case AggCount:
+				row[i] = float64(a.n)
+			case AggSum:
+				row[i] = a.sums[t.metricIndex(g.Metric)]
+			case AggMin:
+				row[i] = a.mins[t.metricIndex(g.Metric)]
+			case AggMax:
+				row[i] = a.maxs[t.metricIndex(g.Metric)]
+			case AggAvg:
+				row[i] = a.sums[t.metricIndex(g.Metric)] / float64(a.n)
+			}
+		}
+		out[k] = row
+	}
+	return out
 }
 
 // visible reports whether a record is visible at the oracle's current clock:
