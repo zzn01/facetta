@@ -166,13 +166,17 @@ All three entry points share the pipeline above through `planGroups`
 budget. Only the per-row action differs — `QueryGroups` sums every metric,
 `QueryAggs` (`agg.go`) folds the requested aggregate columns into a
 fixed-size stack accumulator (still zero-alloc; Min/Max initialize from the
-first matched row, Count/Avg derive from a shared row counter), and
+first matched row, Count/Avg derive from a shared row counter —
+`AggDistinct` columns are the exception: each allocates one id bitmap sized
+by the dim's combined cardinality and counts new ids by test-and-set, exact
+with no popcount pass), and
 `QueryGroupBy` (`groupby.go`) hash-aggregates into a reusable
 `GroupedResult`: the group key is the packed id tuple of the by dims (ids
 identify strings uniquely within one view, across base and delta), map
 lookups use the non-allocating `m[string(bytes)]` form, groups are created
 from their first row (no sentinel init), and the output is sorted by key
-strings for determinism. Its allocations are O(result groups) per call and
+strings for determinism. Distinct columns in group-by dedup per group
+through one shared seen-(column, group, id) set kept on the result. Its allocations are O(result groups) per call and
 amortize on a reused result — the one documented exception to the
 zero-allocation rule.
 

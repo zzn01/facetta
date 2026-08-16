@@ -81,6 +81,7 @@ sums, err := store.QueryAggs(buf, []facetta.Agg{
     {Op: facetta.AggCount},                       // matched row count
     {Metric: "impressions", Op: facetta.AggSum},
     {Metric: "clicks", Op: facetta.AggAvg},       // NaN when nothing matches
+    {Dim: "publisher", Op: facetta.AggDistinct},  // COUNT(DISTINCT publisher)
 }, groups)
 
 // IN condition: dimension equals ANY listed value.
@@ -102,9 +103,17 @@ for i := 0; i < res.N; i++ {
 Semantics and limits:
 
 - **`QueryAggs`** supports `AggSum`, `AggCount`, `AggMin`, `AggMax`, `AggAvg`
-  (up to 16 columns). Over zero matched rows Sum/Count are 0 and Min/Max/Avg
-  are **NaN** (the float64 stand-in for SQL NULL). Zero heap allocations,
-  same as `QueryGroups`.
+  and `AggDistinct` (up to 16 columns). Over zero matched rows Sum/Count/
+  Distinct are 0 and Min/Max/Avg are **NaN** (the float64 stand-in for SQL
+  NULL). Zero heap allocations, same as `QueryGroups` — except `AggDistinct`.
+- **`AggDistinct`** is an **exact** `COUNT(DISTINCT Dim)`: dictionary
+  encoding turns the value set into an id bitmap sized by the dim's known
+  cardinality, so each distinct column costs one bitmap allocation
+  (O(cardinality/64) words, e.g. ~4 KB for 30k publishers) and one
+  test-and-set per matched row — no sketches, no approximation error. In
+  `QueryGroupBy`, distinct counting is per group via a seen-triple set, so
+  its allocations grow with unique (group, value) pairs — worst case
+  O(matched rows).
 - **`Cond.In`** filters rows during the scan but does **not** contribute to
   index-prefix planning: a group whose leading index dims carry only IN
   conditions degrades to a full scan (fail-fast guarded by `MaxScanRows`).
@@ -257,6 +266,7 @@ Measured on an Intel Core i9-9880H (2.30GHz), `go test -bench . -benchmem -run x
 | `BenchmarkQueryWithDelta1M` (1M base + 10k delta, 2 indexed groups) | ~47 µs/op | 0 B/op | 0 allocs/op |
 | `BenchmarkQueryAggsIndexed1M` (as the indexed query, 4 aggregate columns) † | ~1.7× the indexed sum query | 0 B/op | 0 allocs/op |
 | `BenchmarkGroupByIndexed1M` (~20k-row indexed range grouped by an 8-value dim, reused `GroupedResult`) † | ~1.0 ms/op | ~89 B/op | 10 allocs/op |
+| `BenchmarkQueryAggsDistinct1M` (~20k-row indexed range, COUNT(DISTINCT publisher) + sum) † | ~0.47 ms/op | 4 KB/op (one ~30k-bit bitmap) | 1 alloc/op |
 | `BenchmarkApply1K` (1000-record batch onto 1M rows) | ~4 ms/op averaged as the resident delta approaches the 50k compaction threshold (Apply copies the delta columns; the tuple index is map-cloned, not rebuilt) | ~3.9 MB/op | ~1.1k allocs/op |
 | `BenchmarkApplySmallOnLargeDelta` (10-record batch onto a ~100k-row delta) | ~1.9 ms/op (the O(DeltaRows) column copy dominates) | ~8.9 MB/op | ~280 allocs/op |
 | `BenchmarkReplaceAll1M` (full reconcile build, 1M records) | ~560-600 ms/op | ~202 MB/op | ~490 allocs/op |

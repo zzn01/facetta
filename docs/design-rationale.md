@@ -180,6 +180,17 @@ constraint, which drove four decisions:
   the group-union API already expresses (one group per value). A group whose
   leading dims carry only INs degrades to a scan and lands in the existing
   `MaxScanRows` safety net.
+- **Distinct counting is exact, not sketched.** `COUNT(DISTINCT dim)` is
+  normally where engines reach for HyperLogLog, trading error bounds for
+  memory. Here dictionary encoding already collapsed the value space: the
+  distinct set of a dimension IS a bitmap over its ids, whose size is known
+  when the query starts (combined base+extras cardinality) and small
+  (~4 KB for 30k values). Exact costs one allocation per distinct column
+  and one test-and-set per row — an approximation would be slower to merge
+  and strictly worse. Per-group distinct in GROUP BY dedups through a
+  seen-triple set instead, and its documented cost grows with unique
+  (group, value) pairs — worst case O(matched rows), stated rather than
+  hidden.
 - **GROUP BY relaxes the allocation rule — explicitly, and only there.**
   Group-by output is inherently variable-size, so "zero allocations" is
   unattainable; the honest contract is O(result groups) allocations per call

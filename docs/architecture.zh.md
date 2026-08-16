@@ -136,11 +136,14 @@ view.Load()                          ── 唯一一次原子读,之后全程�
 三个入口经由 `planGroups`(`query.go`)共享上面的整条流水线:逐组规划、候选区间
 取并集、执行扫描预算。区别只在每行的动作 —— `QueryGroups` 对全部指标求和;
 `QueryAggs`(`agg.go`)把请求的聚合列折叠进定长的栈上累加器(仍然零分配;
-Min/Max 从首个命中行初始化,Count/Avg 派生自共享的行计数器);`QueryGroupBy`
+Min/Max 从首个命中行初始化,Count/Avg 派生自共享的行计数器 —— `AggDistinct` 列
+是例外:每列分配一张按该维度合并基数定尺寸的 id 位图,以测试并置位(test-and-set)
+计数新 id,结果精确且无需 popcount 遍历);`QueryGroupBy`
 (`groupby.go`)哈希聚合进可复用的 `GroupedResult`:分组键是 by 维度的打包 id
 元组(在同一 view 内、跨 base 与 delta,id 唯一标识字符串),map 查找用不分配的
 `m[string(bytes)]` 形式,分组由其首行直接创建(无需哨兵初始化),输出按键字符串
-排序以保证确定性。它的分配是每次调用 O(结果组数),并在复用的结果上摊销 ——
+排序以保证确定性。group-by 中的 distinct 列经由挂在结果上的一个共享
+seen-(列, 组, id) 集合逐组去重。它的分配是每次调用 O(结果组数),并在复用的结果上摊销 ——
 这是零分配规则唯一的文档化例外。
 
 IN 条件(`Cond.In`)被解析进按查询一份的 id 池(`queryIns`)而不是 `groupPlan`,
