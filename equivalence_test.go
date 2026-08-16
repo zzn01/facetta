@@ -64,9 +64,13 @@ func TestEquivalenceRandomized(t *testing.T) {
 			randAggs := func() []Agg {
 				aggs := make([]Agg, 1+rng.Intn(4))
 				for i := range aggs {
-					op := AggOp(rng.Intn(int(AggAvg) + 1))
+					op := AggOp(rng.Intn(int(AggDistinct) + 1))
 					a := Agg{Op: op}
-					if op != AggCount {
+					switch op {
+					case AggCount:
+					case AggDistinct:
+						a.Dim = sc.Dims[rng.Intn(len(sc.Dims))]
+					default:
 						a.Metric = sc.Metrics[rng.Intn(len(sc.Metrics))]
 					}
 					aggs[i] = a

@@ -22,12 +22,20 @@ type GroupedResult struct {
 	Keys []string  // row-major, N × len(by)
 	Aggs []float64 // row-major, N × len(aggs)
 
-	idx   map[string]int // packed id-tuple -> group ordinal (cleared per call)
-	skeys []string       // unsorted key scratch
-	saggs []float64      // unsorted agg scratch
-	cnt   []int          // per-group matched row count
-	ord   []int          // sort permutation scratch
-	kb    []byte         // key encoding scratch
+	idx   map[string]int    // packed id-tuple -> group ordinal (cleared per call)
+	dset  map[dkey]struct{} // seen (distinct col, group, dim id) triples
+	skeys []string          // unsorted key scratch
+	saggs []float64         // unsorted agg scratch
+	cnt   []int             // per-group matched row count
+	ord   []int             // sort permutation scratch
+	kb    []byte            // key encoding scratch
+}
+
+// dkey identifies one seen (distinct column, group, dim id) triple.
+type dkey struct {
+	c  uint8
+	g  int32
+	id uint32
 }
 
 var (
@@ -44,9 +52,15 @@ func (s *Store) QueryGroupBy(res *GroupedResult, by []string, aggs []Agg, groups
 	if res == nil {
 		return errNilResult
 	}
-	var mets [maxAggs]int
-	if err := s.resolveAggs(aggs, &mets); err != nil {
+	var mets, ddims [maxAggs]int
+	if err := s.resolveAggs(aggs, &mets, &ddims); err != nil {
 		return err
+	}
+	hasDistinct := false
+	for j := range aggs {
+		if ddims[j] >= 0 {
+			hasDistinct = true
+		}
 	}
 	if len(by) == 0 || len(by) > len(s.sc.Dims) {
 		return errBadByDims
@@ -86,6 +100,13 @@ func (s *Store) QueryGroupBy(res *GroupedResult, by []string, aggs []Agg, groups
 	} else {
 		clear(res.idx) // buckets stay warm across calls
 	}
+	if hasDistinct {
+		if res.dset == nil {
+			res.dset = map[dkey]struct{}{}
+		} else {
+			clear(res.dset)
+		}
+	}
 
 	// visit folds one matched row into its group's accumulators, creating the
 	// group from the row on first sight (so min/max need no sentinel init).
@@ -103,9 +124,13 @@ func (s *Store) QueryGroupBy(res *GroupedResult, by []string, aggs []Agg, groups
 				res.skeys = append(res.skeys, v.dimString(d, dimID(d)))
 			}
 			for j := 0; j < na; j++ {
-				if mi := mets[j]; mi >= 0 {
-					res.saggs = append(res.saggs, met(mi))
-				} else {
+				switch {
+				case ddims[j] >= 0: // first row of the group: first distinct value
+					res.dset[dkey{uint8(j), int32(g), dimID(ddims[j])}] = struct{}{}
+					res.saggs = append(res.saggs, 1)
+				case mets[j] >= 0:
+					res.saggs = append(res.saggs, met(mets[j]))
+				default:
 					res.saggs = append(res.saggs, 0)
 				}
 			}
@@ -115,6 +140,14 @@ func (s *Store) QueryGroupBy(res *GroupedResult, by []string, aggs []Agg, groups
 		res.cnt[g]++
 		row := res.saggs[g*na : (g+1)*na]
 		for j := 0; j < na; j++ {
+			if dd := ddims[j]; dd >= 0 {
+				k := dkey{uint8(j), int32(g), dimID(dd)}
+				if _, seen := res.dset[k]; !seen {
+					res.dset[k] = struct{}{}
+					row[j]++
+				}
+				continue
+			}
 			mi := mets[j]
 			if mi < 0 {
 				continue

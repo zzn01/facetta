@@ -107,12 +107,18 @@ func (t *refTable) metricIndex(name string) int {
 
 // queryAggs mirrors Store.QueryAggs: one output per requested aggregate over
 // rows matching ANY group (each row counted once). Min/Max/Avg over zero
-// matched rows are NaN.
+// matched rows are NaN; Distinct over zero matched rows is 0.
 func (t *refTable) queryAggs(aggs []Agg, groups [][]Cond) []float64 {
 	nm := len(t.sc.Metrics)
 	sums := make([]float64, nm)
 	mins := make([]float64, nm)
 	maxs := make([]float64, nm)
+	dsets := make([]map[string]struct{}, len(aggs))
+	for i, a := range aggs {
+		if a.Op == AggDistinct {
+			dsets[i] = map[string]struct{}{}
+		}
+	}
 	n := 0
 	for _, r := range t.data {
 		if !t.visible(r) {
@@ -138,11 +144,18 @@ func (t *refTable) queryAggs(aggs []Agg, groups [][]Cond) []float64 {
 				maxs[m] = v
 			}
 		}
+		for i, a := range aggs {
+			if a.Op == AggDistinct {
+				dsets[i][r.Dims[t.sc.dimIndex(a.Dim)]] = struct{}{}
+			}
+		}
 		n++
 	}
 	out := make([]float64, len(aggs))
 	for i, a := range aggs {
 		switch a.Op {
+		case AggDistinct:
+			out[i] = float64(len(dsets[i]))
 		case AggCount:
 			out[i] = float64(n)
 		case AggSum:
@@ -174,6 +187,7 @@ func (t *refTable) queryGroupBy(by []string, aggs []Agg, groups [][]Cond) map[st
 	nm := len(t.sc.Metrics)
 	type acc struct {
 		sums, mins, maxs []float64
+		dsets            []map[string]struct{}
 		n                int
 	}
 	accs := map[string]*acc{}
@@ -198,7 +212,13 @@ func (t *refTable) queryGroupBy(by []string, aggs []Agg, groups [][]Cond) map[st
 		k := strings.Join(parts, "\x1f")
 		a := accs[k]
 		if a == nil {
-			a = &acc{sums: make([]float64, nm), mins: make([]float64, nm), maxs: make([]float64, nm)}
+			a = &acc{sums: make([]float64, nm), mins: make([]float64, nm), maxs: make([]float64, nm),
+				dsets: make([]map[string]struct{}, len(aggs))}
+			for i, g := range aggs {
+				if g.Op == AggDistinct {
+					a.dsets[i] = map[string]struct{}{}
+				}
+			}
 			accs[k] = a
 		}
 		for m := range nm {
@@ -211,6 +231,11 @@ func (t *refTable) queryGroupBy(by []string, aggs []Agg, groups [][]Cond) map[st
 				a.maxs[m] = v
 			}
 		}
+		for i, g := range aggs {
+			if g.Op == AggDistinct {
+				a.dsets[i][r.Dims[t.sc.dimIndex(g.Dim)]] = struct{}{}
+			}
+		}
 		a.n++
 	}
 	out := map[string][]float64{}
@@ -218,6 +243,8 @@ func (t *refTable) queryGroupBy(by []string, aggs []Agg, groups [][]Cond) map[st
 		row := make([]float64, len(aggs))
 		for i, g := range aggs {
 			switch g.Op {
+			case AggDistinct:
+				row[i] = float64(len(a.dsets[i]))
 			case AggCount:
 				row[i] = float64(a.n)
 			case AggSum:

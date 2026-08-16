@@ -128,6 +128,28 @@ func BenchmarkQueryAggsIndexed1M(b *testing.B) {
 	}
 }
 
+// BenchmarkQueryAggsDistinct1M adds a COUNT(DISTINCT publisher) column to the
+// indexed query; the per-query cost is one ~30k-bit bitmap allocation plus a
+// test-and-set per matched row.
+func BenchmarkQueryAggsDistinct1M(b *testing.B) {
+	s := benchStore(b, 1_000_000)
+	buf := make([]float64, 0, 2)
+	aggs := []Agg{
+		{Dim: "publisher", Op: AggDistinct},
+		{Metric: "visits", Op: AggSum},
+	}
+	groups := [][]Cond{{{Dim: "source", Value: "src7"}}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var err error
+		buf, err = s.QueryAggs(buf, aggs, groups)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkGroupByIndexed1M groups an indexed ~20k-row candidate range
 // (source=src7) by the 8-value os dim, on a reused GroupedResult.
 func BenchmarkGroupByIndexed1M(b *testing.B) {
