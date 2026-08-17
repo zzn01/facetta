@@ -155,26 +155,26 @@ For deadline-sensitive callers, a slow answer is worse than an instant refusal. 
 - **`Config.MaxScanRows`** (store-level) caps per-query scan *work*. After planning, the total work is known before any row is touched: the merged base candidate intervals plus the delta row count. If that sum exceeds the budget, the query returns `ErrScanBudget` immediately — no rows scanned, zero heap allocation on the refusal path. A full scan's `[0,N)` span naturally trips any sane budget on a large table, so there is no separate "no full scans" flag.
 - **`CompactorConfig.MaxDeltaRows`** (compactor-level) keeps the delta small so its unconditional linear scan never dominates.
 
-Both bound **work** (rows visited), not wall-clock. Measured per-row cost is **~5–6 ns/row** (from `BenchmarkQueryFullScan1M`); index range location is a binary search:
+Both bound **work** (rows visited), not wall-clock. Measured per-row cost is **~7 ns/row** (from `BenchmarkQueryFullScan1M`); index range location is a binary search:
 
 ```
 worst-case scan work ≈ log₂(N) steps  +  (MaxScanRows + MaxDeltaRows) × ~6 ns/row
 example: N = 30M, MaxScanRows = 10_000, MaxDeltaRows = 50_000
-       ≈ 25 steps  +  60_000 × 6 ns  ≈ ~360 µs upper bound
+       ≈ 25 steps  +  60_000 × 7 ns  ≈ ~420 µs upper bound
 ```
 
 The formula bounds *work*. Go's GC and scheduler still add tail jitter (sub-millisecond typical) that sits on top and is **not** bounded by the library — the guarantee is "this query will touch at most K rows", not "this query finishes within T wall-clock".
 
 `ErrScanBudget` means **"refused fast, fall back"**: on a hard-deadline path, treat it as "too expensive in this layer" and fall back to the primary store or a degraded answer rather than retrying. The counts behind a refusal (candidate rows, delta rows, budget) are not wrapped into the error — so the refusal path stays allocation-free — but the refusal count is exposed as `Stats().ScanBudgetRefusals`.
 
-Example config bounding worst-case scan work to ~360 µs (10k query budget
-+ 50k delta cap, at the measured ~6 ns/row; tighten `MaxDeltaRows` if your
+Example config bounding worst-case scan work to ~420 µs (10k query budget
++ 50k delta cap, at the measured ~7 ns/row; tighten `MaxDeltaRows` if your
 deadline needs a lower ceiling — the delta term usually dominates):
 
 ```go
 store, _ := facetta.New(schema, facetta.Config{
     MaxRows:     5_000_000,
-    MaxScanRows: 10_000, // ≈ 60 µs of base-scan work, refuse anything larger
+    MaxScanRows: 10_000, // ≈ 70 µs of base-scan work, refuse anything larger
 })
 compactor := facetta.NewCompactor(store, facetta.CompactorConfig{
     DeltaRatio:   0.1,
@@ -260,24 +260,22 @@ Measured on an Intel Core i9-9880H (2.30GHz), `go test -bench . -benchmem -run x
 
 | Benchmark | Time/op | Bytes/op | Allocs/op |
 |-----------|---------|----------|-----------|
-| `BenchmarkQueryIndexed1M` (1M rows, 2 filter groups) | ~350-380 ns/op | 0 B/op | 0 allocs/op |
-| `BenchmarkQueryFullScan1M` (1M rows, 1 group on a non-index dim) | ~5.1-5.6 ms/op | 0 B/op | 0 allocs/op |
-| `BenchmarkQueryMultiGroup1M` (1M rows, 8 indexed groups unioned) | ~1.8 µs/op | 0 B/op | 0 allocs/op |
-| `BenchmarkQueryWithDelta1M` (1M base + 10k delta, 2 indexed groups) | ~47 µs/op | 0 B/op | 0 allocs/op |
-| `BenchmarkQueryAggsIndexed1M` (as the indexed query, 4 aggregate columns) † | ~1.7× the indexed sum query | 0 B/op | 0 allocs/op |
-| `BenchmarkGroupByIndexed1M` (~20k-row indexed range grouped by an 8-value dim, reused `GroupedResult`) † | ~1.0 ms/op | ~89 B/op | 10 allocs/op |
-| `BenchmarkQueryAggsDistinct1M` (~20k-row indexed range, COUNT(DISTINCT publisher) + sum) † | ~0.47 ms/op | 4 KB/op (one ~30k-bit bitmap) | 1 alloc/op |
-| `BenchmarkApply1K` (1000-record batch onto 1M rows) | ~4 ms/op averaged as the resident delta approaches the 50k compaction threshold (Apply copies the delta columns; the tuple index is map-cloned, not rebuilt) | ~3.9 MB/op | ~1.1k allocs/op |
-| `BenchmarkApplySmallOnLargeDelta` (10-record batch onto a ~100k-row delta) | ~1.9 ms/op (the O(DeltaRows) column copy dominates) | ~8.9 MB/op | ~280 allocs/op |
-| `BenchmarkReplaceAll1M` (full reconcile build, 1M records) | ~560-600 ms/op | ~202 MB/op | ~490 allocs/op |
-| `BenchmarkSaveSnapshot1M` (1M rows) | ~98-108 ms/op | ~1 MB/op | 15 allocs/op |
-| `BenchmarkLoadSnapshot1M` (1M rows, fresh `Store` per iteration) | ~52 ms/op | ~119 MB/op | ~32.7k allocs/op |
-| `BenchmarkCompact1M` (1M base + 1k delta merged per iteration, with dictionary compaction, `-benchtime=5x`) | ~88 ms/op | ~67 MB/op | ~424 allocs/op |
-| `BenchmarkCompactIDStable1M` (as above on the gated id-stable path, `DictCompactInterval` open) | ~52 ms/op | ~60 MB/op | ~34 allocs/op |
+| `BenchmarkQueryIndexed1M` (1M rows, 2 filter groups) | ~500 ns/op | 0 B/op | 0 allocs/op |
+| `BenchmarkQueryFullScan1M` (1M rows, 1 group on a non-index dim) | ~7.2 ms/op | 0 B/op | 0 allocs/op |
+| `BenchmarkQueryMultiGroup1M` (1M rows, 8 indexed groups unioned) | ~2.3 µs/op | 0 B/op | 0 allocs/op |
+| `BenchmarkQueryWithDelta1M` (1M base + 10k delta, 2 indexed groups) | ~67 µs/op | 0 B/op | 0 allocs/op |
+| `BenchmarkQueryAggsIndexed1M` (as the indexed query, 4 aggregate columns) | ~0.9 µs/op | 0 B/op | 0 allocs/op |
+| `BenchmarkGroupByIndexed1M` (~20k-row indexed range grouped by an 8-value dim, reused `GroupedResult`) | ~1.1 ms/op | ~89 B/op | 10 allocs/op |
+| `BenchmarkQueryAggsDistinct1M` (~20k-row indexed range, COUNT(DISTINCT publisher) + sum) | ~0.6 ms/op | 4 KB/op (one ~30k-bit bitmap) | 1 alloc/op |
+| `BenchmarkApply1K` (1000-record batch onto 1M rows) | ~4.5 ms/op averaged as the resident delta approaches the 50k compaction threshold (Apply copies the delta columns; the tuple index is map-cloned, not rebuilt) | ~3.8 MB/op | ~1.1k allocs/op |
+| `BenchmarkApplySmallOnLargeDelta` (10-record batch onto a ~100k-row delta) | ~2.4 ms/op (the O(DeltaRows) column copy dominates) | ~8.9 MB/op | ~283 allocs/op |
+| `BenchmarkReplaceAll1M` (full reconcile build, 1M records) | ~570 ms/op | ~202 MB/op | ~490 allocs/op |
+| `BenchmarkSaveSnapshot1M` (1M rows) | ~180 ms/op | ~1 MB/op | 15 allocs/op |
+| `BenchmarkLoadSnapshot1M` (1M rows, fresh `Store` per iteration) | ~56 ms/op | ~119 MB/op | ~32.7k allocs/op |
+| `BenchmarkCompact1M` (1M base + 1k delta merged per iteration, with dictionary compaction, `-benchtime=5x`) | ~88 ms/op | ~67 MB/op | ~427 allocs/op |
+| `BenchmarkCompactIDStable1M` (as above on the gated id-stable path, `DictCompactInterval` open) | ~50 ms/op | ~60 MB/op | ~34 allocs/op |
 
-† measured in a later session whose machine ran globally slower (same-day A/B put the pre-existing rows at their old relative levels, unregressed within ±3% noise); the ratio and the allocation counts are the durable numbers.
-
-`BenchmarkQueryFullScan1M` shows the degraded full-scan path costs roughly 14,000x an indexed lookup (~5.3 ms vs ~370 ns); `BenchmarkQueryWithDelta1M` shows a 10k-row delta overlay adds ~120x over the delta-free indexed query (~47 µs vs ~370 ns) from its linear scan. Queries against views with no expirable rows skip all per-row expiry checks (and the clock sample), so tables that never set `ExpireAt` pay nothing for the per-record TTL feature. Base rows are also exempt from per-row checks while the earliest base expiry is still in the future — the expire column is only touched once a row could actually be expired.
+`BenchmarkQueryFullScan1M` shows the degraded full-scan path costs roughly 14,000x an indexed lookup (~7.2 ms vs ~500 ns); `BenchmarkQueryWithDelta1M` shows a 10k-row delta overlay adds ~130x over the delta-free indexed query (~67 µs vs ~500 ns) from its linear scan. Queries against views with no expirable rows skip all per-row expiry checks (and the clock sample), so tables that never set `ExpireAt` pay nothing for the per-record TTL feature. Base rows are also exempt from per-row checks while the earliest base expiry is still in the future — the expire column is only touched once a row could actually be expired.
 
 `TestCapacity5M` (5M rows, `go test -run TestCapacity5M -v`):
 
@@ -285,9 +283,9 @@ Measured on an Intel Core i9-9880H (2.30GHz), `go test -bench . -benchmem -run x
 |--------|----------|--------|
 | Resident memory (heap growth) | ~290 MB (incl. the per-record expiry column, ~8 B/row) | < 400 MB |
 | Heap objects growth | ~32,180 (tracks the ~30k publisher cardinality, not row count) | < 1,000,000 |
-| Full build (`ReplaceAll`, 5M rows) | ~3.2-3.9 s | informational |
-| Compact (5M base + 50k delta merge, incl. dictionary compaction) | ~430 ms | < 2 s |
-| Indexed query | ~460-660 ns/op | <= 5 µs |
+| Full build (`ReplaceAll`, 5M rows) | ~3.8 s | informational |
+| Compact (5M base + 50k delta merge, incl. dictionary compaction) | ~450 ms | < 2 s |
+| Indexed query | ~500-720 ns/op | <= 5 µs |
 
 ### Design Note
 
