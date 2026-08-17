@@ -3,7 +3,7 @@ package facetta
 import "testing"
 
 func TestDict(t *testing.T) {
-	d := newDict()
+	d := newDict(false)
 	if d.len() != 0 {
 		t.Fatal("new dict not empty")
 	}

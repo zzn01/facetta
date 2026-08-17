@@ -18,21 +18,34 @@ type Cond struct {
 	// value instead. At most 16 values per condition, 16 IN conditions and
 	// 128 resolved values per query.
 	In []string
+	// Range, when non-nil, matches rows whose Dim value (a number — see
+	// DimNumeric: identity on such dims IS the number) falls within
+	// [Min, Max] (inclusive; use math.Inf for open ends). Mutually exclusive
+	// with Value and In. Like In, Range filters rows but does not join
+	// index-prefix planning. At most 16 range conditions per query.
+	Range *Range
 }
 
+// Range is a closed numeric interval for Cond.Range.
+type Range struct{ Min, Max float64 }
+
 var (
-	errBadGroupCount   = errors.New("facetta: need 1..16 filter groups")
-	errTooManyConds    = errors.New("facetta: too many conditions in group")
-	errCondValueAndIn  = errors.New("facetta: Cond.Value and Cond.In are mutually exclusive")
-	errTooManyInValues = errors.New("facetta: too many IN values in query")
+	errBadGroupCount     = errors.New("facetta: need 1..16 filter groups")
+	errTooManyConds      = errors.New("facetta: too many conditions in group")
+	errCondValueAndIn    = errors.New("facetta: Cond.Value and Cond.In are mutually exclusive")
+	errTooManyInValues   = errors.New("facetta: too many IN values in query")
+	errCondRangeConflict = errors.New("facetta: Cond.Range is mutually exclusive with Value and In")
+	errTooManyRanges     = errors.New("facetta: too many range conditions in query")
 )
 
 const (
 	maxInConds = 16  // total IN conditions per query
 	maxInIDs   = 128 // total resolved IN values per query
+	maxRanges  = 16  // total range conditions per query
 )
 
-// queryIns is the per-query pool of resolved IN conditions, shared by all
+// queryIns is the per-query pool of resolved IN and range conditions,
+// shared by all
 // group plans: plan gi owns the contiguous window
 // [pOff[gi], pOff[gi]+pN[gi]) of dims/offs/lens, and condition k's candidate
 // ids live in pool[offs[k] : offs[k]+lens[k]]. Everything IN-related lives
@@ -49,6 +62,14 @@ type queryIns struct {
 	offs   [maxInConds]uint16
 	lens   [maxInConds]uint8
 	pool   [maxInIDs]uint32
+
+	// range conditions, same per-plan windowing (rOff/rN over rDims/rMin/rMax)
+	nRanges int
+	rOff    [maxGroups]uint8
+	rN      [maxGroups]uint8
+	rDims   [maxRanges]uint8
+	rMin    [maxRanges]float64
+	rMax    [maxRanges]float64
 }
 
 type groupPlan struct {
@@ -78,6 +99,22 @@ func (v *view) plan(sc *Schema, g []Cond, p *groupPlan, ins *queryIns) error {
 		if di < 0 {
 			return fmt.Errorf("facetta: unknown dimension %q", c.Dim)
 		}
+		if c.Range != nil {
+			if c.Value != "" || len(c.In) > 0 {
+				return errCondRangeConflict
+			}
+			if !sc.isNumeric(di) {
+				return fmt.Errorf("facetta: dimension %q is not DimNumeric", c.Dim)
+			}
+			if ins.nRanges == maxRanges {
+				return errTooManyRanges
+			}
+			k := ins.nRanges
+			ins.rDims[k] = uint8(di)
+			ins.rMin[k], ins.rMax[k] = c.Range.Min, c.Range.Max
+			ins.nRanges++
+			continue
+		}
 		if len(c.In) > 0 {
 			if c.Value != "" {
 				return errCondValueAndIn
@@ -88,7 +125,17 @@ func (v *view) plan(sc *Schema, g []Cond, p *groupPlan, ins *queryIns) error {
 			off, cnt := ins.nIDs, 0
 			anyBase := false
 			for _, val := range c.In {
-				id, ok := v.lookupID(di, val)
+				var id uint32
+				var ok bool
+				if sc.isNumeric(di) {
+					var valid bool
+					id, ok, valid = v.lookupNumID(di, val)
+					if !valid {
+						return fmt.Errorf("facetta: non-numeric value %q for numeric dimension %q", val, c.Dim)
+					}
+				} else {
+					id, ok = v.lookupID(di, val)
+				}
 				if !ok {
 					continue // value nowhere in the table: drop from the set
 				}
@@ -116,7 +163,17 @@ func (v *view) plan(sc *Schema, g []Cond, p *groupPlan, ins *queryIns) error {
 			}
 			continue
 		}
-		id, ok := v.lookupID(di, c.Value)
+		var id uint32
+		var ok bool
+		if sc.isNumeric(di) {
+			var valid bool
+			id, ok, valid = v.lookupNumID(di, c.Value)
+			if !valid {
+				return fmt.Errorf("facetta: non-numeric value %q for numeric dimension %q", c.Value, c.Dim)
+			}
+		} else {
+			id, ok = v.lookupID(di, c.Value)
+		}
 		if !ok {
 			p.dead = true // value nowhere in the table
 			return nil
@@ -185,6 +242,27 @@ func (q *queryIns) matchIns(gi int, dims [][]uint32, r int) bool {
 	return true
 }
 
+// matchRanges checks plan gi's range conditions against one row's dim ids,
+// resolving parsed values through the view's combined id space. Kept out of
+// matchBase/matchDelta for the same inline-budget reason as matchIns.
+func (q *queryIns) matchRanges(gi int, v *view, dims [][]uint32, r int) bool {
+	off := int(q.rOff[gi])
+	for k := off; k < off+int(q.rN[gi]); k++ {
+		d := int(q.rDims[k])
+		id := dims[d][r]
+		var val float64
+		if n := uint32(v.base.dicts[d].len()); id >= n {
+			val = v.extras[d].vals[id-n]
+		} else {
+			val = v.base.dicts[d].vals[id]
+		}
+		if !(val >= q.rMin[k] && val <= q.rMax[k]) {
+			return false // NaN (unparseable) fails here too
+		}
+	}
+	return true
+}
+
 // matchBase checks equality conditions only; IN conditions are checked by the
 // caller via matchIns (see its comment for why).
 func (p *groupPlan) matchBase(v *view, r int) bool {
@@ -229,9 +307,9 @@ func (s *Store) planGroups(v *view, groups [][]Cond, plans *[maxGroups]groupPlan
 	}
 	sc := &s.sc
 	for gi := range groups {
-		off := 0
+		off, roff := 0, 0
 		if ins != nil {
-			off = ins.nConds
+			off, roff = ins.nConds, ins.nRanges
 		}
 		if err := v.plan(sc, groups[gi], &plans[gi], ins); err != nil {
 			return 0, err
@@ -239,6 +317,8 @@ func (s *Store) planGroups(v *view, groups [][]Cond, plans *[maxGroups]groupPlan
 		if ins != nil {
 			ins.pOff[gi] = uint8(off)
 			ins.pN[gi] = uint8(ins.nConds - off)
+			ins.rOff[gi] = uint8(roff)
+			ins.rN[gi] = uint8(ins.nRanges - roff)
 		}
 		if plans[gi].scan {
 			s.st.fullScans.Add(1)
@@ -310,11 +390,11 @@ func (s *Store) queryClock(v *view) (baseExp, deltaExp bool, nowMilli int64) {
 	return baseExp, deltaExp, nowMilli
 }
 
-// hasInConds reports whether any group carries an IN condition.
-func hasInConds(groups [][]Cond) bool {
+// hasFilterConds reports whether any group carries an IN or range condition.
+func hasFilterConds(groups [][]Cond) bool {
 	for _, g := range groups {
 		for _, c := range g {
-			if len(c.In) > 0 {
+			if len(c.In) > 0 || c.Range != nil {
 				return true
 			}
 		}
@@ -325,10 +405,11 @@ func hasInConds(groups [][]Cond) bool {
 // QueryGroups sums all metrics over rows matching ANY group. dst is reused
 // when cap(dst) >= len(Metrics); the call performs zero heap allocations.
 func (s *Store) QueryGroups(dst []float64, groups [][]Cond) ([]float64, error) {
-	// The IN scratch pool lives in this thin wrapper and only when needed:
-	// zero-initializing its ~600B on every call costs ~15% on the indexed
-	// fast path (measured), so IN-free queries pass nil and never pay it.
-	if !hasInConds(groups) {
+	// The IN/range scratch pool lives in this thin wrapper and only when
+	// needed: zero-initializing it on every call costs ~15% on the indexed
+	// fast path (measured), so queries without In or Range pass nil and
+	// never pay it.
+	if !hasFilterConds(groups) {
 		return s.queryGroups(dst, groups, nil)
 	}
 	var ins queryIns
@@ -367,7 +448,9 @@ func (s *Store) queryGroups(dst []float64, groups [][]Cond, ins *queryIns) ([]fl
 				}
 			}
 			for gi := range groups {
-				if plans[gi].matchBase(v, r) && (ins == nil || ins.pN[gi] == 0 || ins.matchIns(gi, v.base.dims, r)) {
+				if plans[gi].matchBase(v, r) && (ins == nil ||
+					((ins.pN[gi] == 0 || ins.matchIns(gi, v.base.dims, r)) &&
+						(ins.rN[gi] == 0 || ins.matchRanges(gi, v, v.base.dims, r)))) {
 					for m := range dst {
 						dst[m] += v.base.mets[m][r]
 					}
@@ -386,7 +469,9 @@ func (s *Store) queryGroups(dst []float64, groups [][]Cond, ins *queryIns) ([]fl
 			}
 		}
 		for gi := range groups {
-			if plans[gi].matchDelta(d, r) && (ins == nil || ins.pN[gi] == 0 || ins.matchIns(gi, d.dims, r)) {
+			if plans[gi].matchDelta(d, r) && (ins == nil ||
+				((ins.pN[gi] == 0 || ins.matchIns(gi, d.dims, r)) &&
+					(ins.rN[gi] == 0 || ins.matchRanges(gi, v, d.dims, r)))) {
 				for m := range dst {
 					dst[m] += d.mets[m][r]
 				}

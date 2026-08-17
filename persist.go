@@ -187,7 +187,7 @@ func readSnapshotFile(path string, sc *Schema, ttlCutoff int64) (*snapshot, erro
 		if !ok {
 			return nil, errSnapshotFormat
 		}
-		snap.dicts[d] = newDict()
+		snap.dicts[d] = newDict(sc.isNumeric(d))
 		for range cnt {
 			sl, ok := rdU32()
 			if !ok {
@@ -201,6 +201,15 @@ func readSnapshotFile(path string, sc *Schema, ttlCutoff int64) (*snapshot, erro
 		}
 		if snap.dicts[d].len() != int(cnt) {
 			return nil, errSnapshotFormat // duplicate strings in stored dict
+		}
+		if sc.isNumeric(d) {
+			// numeric identity: every stored entry must already be canonical
+			// (guards snapshots written before the dim was declared numeric)
+			for _, str := range snap.dicts[d].strs {
+				if cs, ok := canonNum(str); !ok || cs != str {
+					return nil, errSnapshotFormat
+				}
+			}
 		}
 		cards[d] = int(cnt)
 	}

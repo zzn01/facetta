@@ -2,6 +2,8 @@ package facetta
 
 import (
 	"math"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -17,13 +19,40 @@ type refTable struct {
 }
 
 func newRefTable(sc Schema) *refTable {
+	if err := sc.validate(); err != nil {
+		panic(err) // oracle mirrors the engine: only valid schemas
+	}
 	return &refTable{sc: sc, data: map[string]Record{}, now: time.Now}
+}
+
+// refCanon is the oracle's independent canonical numeric spelling.
+func refCanon(s string) (string, bool) {
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+		return "", false
+	}
+	return strconv.FormatFloat(v, 'g', -1, 64), true
+}
+
+// canonDims returns a copy of dims with numeric dims rewritten to their
+// canonical spelling (identity = the number).
+func (t *refTable) canonDims(dims []string) []string {
+	out := slices.Clone(dims)
+	for i := range out {
+		if t.sc.isNumeric(i) {
+			if cs, ok := refCanon(out[i]); ok {
+				out[i] = cs
+			}
+		}
+	}
+	return out
 }
 
 func refKey(dims []string) string { return strings.Join(dims, "\x1f") }
 
 func (t *refTable) apply(recs []Record) {
 	for _, r := range recs {
+		r.Dims = t.canonDims(r.Dims)
 		k := refKey(r.Dims)
 		if old, ok := t.data[k]; ok && old.UpdatedAt.After(r.UpdatedAt) {
 			continue
@@ -78,9 +107,19 @@ func (t *refTable) matches(r Record, g []Cond) bool {
 		if di < 0 {
 			return false
 		}
-		if len(c.In) > 0 {
+		if c.Range != nil {
+			v, err := strconv.ParseFloat(r.Dims[di], 64)
+			if err != nil || !(v >= c.Range.Min && v <= c.Range.Max) {
+				return false
+			}
+		} else if len(c.In) > 0 {
 			ok := false
 			for _, v := range c.In {
+				if t.sc.isNumeric(di) {
+					if cs, okc := refCanon(v); okc {
+						v = cs
+					}
+				}
 				if r.Dims[di] == v {
 					ok = true
 					break
@@ -89,8 +128,16 @@ func (t *refTable) matches(r Record, g []Cond) bool {
 			if !ok {
 				return false
 			}
-		} else if r.Dims[di] != c.Value {
-			return false
+		} else {
+			cv := c.Value
+			if t.sc.isNumeric(di) {
+				if cs, okc := refCanon(cv); okc {
+					cv = cs
+				}
+			}
+			if r.Dims[di] != cv {
+				return false
+			}
 		}
 	}
 	return true

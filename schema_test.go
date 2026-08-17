@@ -7,7 +7,10 @@ import (
 
 func testSchema() Schema {
 	return Schema{
-		Dims:      []string{"source", "account", "publisher", "country", "os"},
+		Dims: []Dim{
+			{Name: "source"}, {Name: "account"}, {Name: "publisher"},
+			{Name: "country"}, {Name: "os"},
+		},
 		IndexDims: 3,
 		Metrics:   []string{"visits", "revenue"},
 	}
@@ -20,11 +23,13 @@ func TestSchemaValidate(t *testing.T) {
 	}
 	bad := []Schema{
 		{Dims: nil, IndexDims: 0, Metrics: []string{"m"}},
-		{Dims: []string{"a"}, IndexDims: 0, Metrics: []string{"m"}},
-		{Dims: []string{"a"}, IndexDims: 2, Metrics: []string{"m"}},
-		{Dims: []string{"a", "a"}, IndexDims: 1, Metrics: []string{"m"}},
-		{Dims: []string{"a"}, IndexDims: 1, Metrics: nil},
-		{Dims: []string{"a"}, IndexDims: 1, Metrics: []string{"m", "m"}},
+		{Dims: []Dim{{Name: "a"}}, IndexDims: 0, Metrics: []string{"m"}},
+		{Dims: []Dim{{Name: "a"}}, IndexDims: 2, Metrics: []string{"m"}},
+		{Dims: []Dim{{Name: "a"}, {Name: "a"}}, IndexDims: 1, Metrics: []string{"m"}},
+		{Dims: []Dim{{Name: ""}}, IndexDims: 1, Metrics: []string{"m"}},
+		{Dims: []Dim{{Name: "a"}}, IndexDims: 1, Metrics: nil},
+		{Dims: []Dim{{Name: "a"}}, IndexDims: 1, Metrics: []string{"m", "m"}},
+		{Dims: []Dim{{Name: "a", Type: 99}}, IndexDims: 1, Metrics: []string{"m"}},
 	}
 	for i, s := range bad {
 		if err := s.validate(); err == nil {

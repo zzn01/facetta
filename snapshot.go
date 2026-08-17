@@ -90,7 +90,7 @@ func emptySnapshot(sc *Schema) *snapshot {
 		mets:  make([][]float64, len(sc.Metrics)),
 	}
 	for i := range s.dicts {
-		s.dicts[i] = newDict()
+		s.dicts[i] = newDict(sc.isNumeric(i))
 	}
 	s.shifts, _ = computeShifts(make([]int, sc.IndexDims), sc.IndexDims)
 	return s
@@ -106,7 +106,7 @@ func buildFromRecords(sc *Schema, recs []Record, ttlCutoff, now int64) (*snapsho
 	nd, nm := len(sc.Dims), len(sc.Metrics)
 	dicts := make([]*dict, nd)
 	for i := range dicts {
-		dicts[i] = newDict()
+		dicts[i] = newDict(sc.isNumeric(i))
 	}
 	ids := make([]uint32, 0, len(recs)*nd)
 	ups := make([]int64, 0, len(recs))
@@ -121,7 +121,15 @@ func buildFromRecords(sc *Schema, recs []Record, ttlCutoff, now int64) (*snapsho
 			continue
 		}
 		for d := range nd {
-			ids = append(ids, dicts[d].getOrAdd(r.Dims[d]))
+			sv := r.Dims[d]
+			if sc.isNumeric(d) {
+				cs, ok := canonNum(sv)
+				if !ok {
+					return nil, fmt.Errorf("facetta: record %d: non-numeric value %q for numeric dimension %q", i, sv, sc.Dims[d].Name)
+				}
+				sv = cs
+			}
+			ids = append(ids, dicts[d].getOrAdd(sv))
 		}
 		metsIn = append(metsIn, r.Metrics...)
 		ups = append(ups, u)
@@ -271,7 +279,7 @@ func mergeView(sc *Schema, v *view, ttlCutoff, now int64, renumber bool) (*snaps
 	dicts := make([]*dict, nd)
 	remap := make([][]uint32, nd)
 	for i := range nd {
-		dicts[i] = newDict()
+		dicts[i] = newDict(sc.isNumeric(i))
 		baseLen := base.dicts[i].len()
 		card := baseLen + v.extras[i].len()
 		remap[i] = make([]uint32, card)

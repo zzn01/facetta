@@ -86,7 +86,7 @@ func TestCompactReclaimsDict(t *testing.T) {
 func TestCompactRecoversKeyOverflow(t *testing.T) {
 	sc := Schema{IndexDims: 16, Metrics: []string{"m"}}
 	for i := range 16 {
-		sc.Dims = append(sc.Dims, fmt.Sprintf("d%d", i))
+		sc.Dims = append(sc.Dims, Dim{Name: fmt.Sprintf("d%d", i)})
 	}
 	s, err := New(sc, Config{})
 	if err != nil {
@@ -218,7 +218,7 @@ func TestCompactDictGatingByInterval(t *testing.T) {
 func TestCompactOverflowRetriesRenumberInsideGate(t *testing.T) {
 	sc := Schema{IndexDims: 16, Metrics: []string{"m"}}
 	for i := range 16 {
-		sc.Dims = append(sc.Dims, fmt.Sprintf("d%d", i))
+		sc.Dims = append(sc.Dims, Dim{Name: fmt.Sprintf("d%d", i)})
 	}
 	s, err := New(sc, Config{DictCompactInterval: time.Hour})
 	if err != nil {

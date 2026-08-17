@@ -128,6 +128,38 @@ func BenchmarkQueryAggsIndexed1M(b *testing.B) {
 	}
 }
 
+// BenchmarkQueryRangeFilter1M filters an indexed ~20k-row candidate range by
+// a numeric range condition on the country dim (values are numeric strings;
+// parsing happened at dictionary insertion, the query does two float
+// comparisons per row).
+func BenchmarkQueryRangeFilter1M(b *testing.B) {
+	rows := buildRows(1_000_000)
+	for i := range rows {
+		rows[i].Dims[3] = rows[i].Dims[3][1:] // "c137" -> "137": numeric country
+	}
+	s, err := New(numericSchema(), Config{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := s.ReplaceAll(rows); err != nil {
+		b.Fatal(err)
+	}
+	buf := make([]float64, 0, 2)
+	groups := [][]Cond{{
+		{Dim: "source", Value: "src7"},
+		{Dim: "country", Range: &Range{Min: 50, Max: 150}},
+	}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var err error
+		buf, err = s.QueryGroups(buf, groups)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkQueryAggsDistinct1M adds a COUNT(DISTINCT publisher) column to the
 // indexed query; the per-query cost is one ~30k-bit bitmap allocation plus a
 // test-and-set per matched row.

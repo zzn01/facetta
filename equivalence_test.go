@@ -17,6 +17,7 @@ func TestEquivalenceRandomized(t *testing.T) {
 		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
 			rng := rand.New(rand.NewSource(seed))
 			sc := testSchema()
+			sc.Dims[3].Type = DimNumeric // country
 			// odd seeds gate dictionary compaction so both merge paths
 			// (id-stable and renumbering) run under the random workload
 			cfg := Config{}
@@ -45,17 +46,35 @@ func TestEquivalenceRandomized(t *testing.T) {
 					for range nc {
 						d := rng.Intn(len(sc.Dims))
 						val := func() string {
-							return fmt.Sprintf("%s%d", sc.Dims[d][:1], rng.Intn(card+1)) // sometimes absent
+							if sc.Dims[d].Name == "country" {
+								// numeric dim: random spelling of the same number
+								n := rng.Intn(card + 1)
+								switch rng.Intn(3) {
+								case 0:
+									return fmt.Sprintf("%d.0", n)
+								case 1:
+									return fmt.Sprintf("%02d", n)
+								default:
+									return fmt.Sprintf("%d", n)
+								}
+							}
+							return fmt.Sprintf("%s%d", sc.Dims[d].Name[:1], rng.Intn(card+1)) // sometimes absent
 						}
-						if rng.Intn(4) == 0 {
+						switch {
+						case rng.Intn(4) == 0:
 							// ~1 in 4 conditions is an IN set of 1-3 values
 							in := make([]string, 1+rng.Intn(3))
 							for i := range in {
 								in[i] = val()
 							}
-							groups[g] = append(groups[g], Cond{Dim: sc.Dims[d], In: in})
-						} else {
-							groups[g] = append(groups[g], Cond{Dim: sc.Dims[d], Value: val()})
+							groups[g] = append(groups[g], Cond{Dim: sc.Dims[d].Name, In: in})
+						case rng.Intn(4) == 0 && sc.Dims[d].Name == "country":
+							// numeric dim: sometimes a range (possibly inverted -> empty)
+							lo := float64(rng.Intn(card + 2))
+							hi := float64(rng.Intn(card + 2))
+							groups[g] = append(groups[g], Cond{Dim: "country", Range: &Range{Min: lo, Max: hi}})
+						default:
+							groups[g] = append(groups[g], Cond{Dim: sc.Dims[d].Name, Value: val()})
 						}
 					}
 				}
@@ -69,7 +88,7 @@ func TestEquivalenceRandomized(t *testing.T) {
 					switch op {
 					case AggCount:
 					case AggDistinct:
-						a.Dim = sc.Dims[rng.Intn(len(sc.Dims))]
+						a.Dim = sc.Dims[rng.Intn(len(sc.Dims))].Name
 					default:
 						a.Metric = sc.Metrics[rng.Intn(len(sc.Metrics))]
 					}
@@ -110,7 +129,7 @@ func TestEquivalenceRandomized(t *testing.T) {
 
 					by := make([]string, 0, 2)
 					for _, d := range rng.Perm(len(sc.Dims))[:1+rng.Intn(2)] {
-						by = append(by, sc.Dims[d])
+						by = append(by, sc.Dims[d].Name)
 					}
 					if err := s.QueryGroupBy(&res, by, aggs, groups); err != nil {
 						t.Fatalf("%s: group-by: %v", step, err)
@@ -140,6 +159,17 @@ func TestEquivalenceRandomized(t *testing.T) {
 				for i := range recs {
 					tsCounter++
 					r := randomRecord(rng, card)
+					// numeric country in a random spelling: canonical identity
+					// must collapse them identically on both sides
+					n := rng.Intn(card + 1)
+					switch rng.Intn(3) {
+					case 0:
+						r.Dims[3] = fmt.Sprintf("%d.0", n)
+					case 1:
+						r.Dims[3] = fmt.Sprintf("%02d", n)
+					default:
+						r.Dims[3] = fmt.Sprintf("%d", n)
+					}
 					if rng.Intn(10) == 0 {
 						// ~1 in 10 records are out-of-order older timestamps so
 						// stale upserts against newer rows get exercised.

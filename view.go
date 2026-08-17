@@ -4,8 +4,10 @@ import (
 	"encoding/binary"
 	"fmt"
 	"maps"
+	"math"
 	"slices"
 	"sort"
+	"strconv"
 )
 
 // delta is the small mutable-by-copy overlay of freshly upserted rows,
@@ -42,7 +44,7 @@ type view struct {
 func newView(base *snapshot) *view {
 	extras := make([]*dict, len(base.sc.Dims))
 	for i := range extras {
-		extras[i] = newDict()
+		extras[i] = newDict(base.sc.isNumeric(i))
 	}
 	return &view{base: base, delta: emptyDelta(base.sc), extras: extras}
 }
@@ -55,6 +57,27 @@ func (v *view) lookupID(dim int, s string) (uint32, bool) {
 		return uint32(v.base.dicts[dim].len()) + id, true
 	}
 	return 0, false
+}
+
+// lookupNumID resolves a numeric dim's condition value: parse it, render the
+// canonical spelling into a stack buffer, and look that up allocation-free
+// (map indexing with string(bytes) does not allocate). valid is false when
+// the value does not parse as a finite number — a caller error on a numeric
+// dim, reported rather than silently matching nothing.
+func (v *view) lookupNumID(dim int, s string) (id uint32, found, valid bool) {
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, false, false
+	}
+	var buf [32]byte
+	b := strconv.AppendFloat(buf[:0], f, 'g', -1, 64)
+	if id, ok := v.base.dicts[dim].lookupB(b); ok {
+		return id, true, true
+	}
+	if id, ok := v.extras[dim].lookupB(b); ok {
+		return uint32(v.base.dicts[dim].len()) + id, true, true
+	}
+	return 0, false, true
 }
 
 // dimString resolves a combined-space dim id back to its string: below the
@@ -163,13 +186,21 @@ func (v *view) applyDelta(sc *Schema, recs []Record, ttlCutoff int64, capBlocked
 		e := expireMilli(rec.ExpireAt)
 		allInBase := true
 		for d := range nd {
-			if id, ok := v.base.dicts[d].lookup(rec.Dims[d]); ok {
+			sv := rec.Dims[d]
+			if sc.isNumeric(d) {
+				cs, ok := canonNum(sv)
+				if !ok {
+					return nil, dropped, fmt.Errorf("facetta: record %d: non-numeric value %q for numeric dimension %q", i, sv, sc.Dims[d].Name)
+				}
+				sv = cs
+			}
+			if id, ok := v.base.dicts[d].lookup(sv); ok {
 				ids[d] = id
 				continue
 			}
 			allInBase = false
 			baseLen := uint32(v.base.dicts[d].len())
-			if id, ok := nv.extras[d].lookup(rec.Dims[d]); ok {
+			if id, ok := nv.extras[d].lookup(sv); ok {
 				ids[d] = baseLen + id
 				continue
 			}
@@ -177,7 +208,7 @@ func (v *view) applyDelta(sc *Schema, recs []Record, ttlCutoff int64, capBlocked
 				nv.extras[d] = nv.extras[d].clone()
 				extrasOwned[d] = true
 			}
-			ids[d] = baseLen + nv.extras[d].getOrAdd(rec.Dims[d])
+			ids[d] = baseLen + nv.extras[d].getOrAdd(sv)
 		}
 		kb = idKey(kb, ids)
 		if r, ok := nd2.index[string(kb)]; ok {

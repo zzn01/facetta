@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"math"
+	"strconv"
 	"time"
 )
 
@@ -39,8 +41,35 @@ var (
 // planning and upsert row matching narrow by the packed index prefix, and a
 // low-cardinality prefix over a high-cardinality table degrades them toward
 // linear scans.
+// DimType selects a dimension's value semantics.
+type DimType uint8
+
+const (
+	// DimString treats values as opaque labels; equality and IN only.
+	// The zero value, so plain Dim{Name: "..."} declares a string dim.
+	DimString DimType = iota
+	// DimNumeric declares values to be numbers (encode times as unix
+	// timestamps), enabling Cond.Range. On these dims IDENTITY IS THE
+	// NUMBER: every value is canonicalized at the write and query
+	// boundaries ("1.0"/"01"/"1e0" are one row, one dictionary entry, one
+	// group-by key "1"; integers exact up to 2^53). Non-numeric or
+	// non-finite values are rejected — Apply/ReplaceAll and conditions
+	// error instead of silently mismatching. The snapshot format and the
+	// schema fingerprint are unaffected by the type; snapshots holding
+	// non-canonical values for a numeric dim are refused at load
+	// (full-pull fallback).
+	DimNumeric
+)
+
+// Dim declares one dimension: its name and value semantics. Future per-dim
+// attributes are added here, so the declaration grows without breaking.
+type Dim struct {
+	Name string
+	Type DimType
+}
+
 type Schema struct {
-	Dims      []string
+	Dims      []Dim
 	IndexDims int
 	Metrics   []string // metric names; values are float64 in Record.Metrics
 }
@@ -57,10 +86,13 @@ func (s *Schema) validate() error {
 	}
 	seen := map[string]bool{}
 	for _, d := range s.Dims {
-		if d == "" || seen[d] {
-			return fmt.Errorf("facetta: empty or duplicate dimension %q", d)
+		if d.Name == "" || seen[d.Name] {
+			return fmt.Errorf("facetta: empty or duplicate dimension %q", d.Name)
 		}
-		seen[d] = true
+		if d.Type > DimNumeric {
+			return fmt.Errorf("facetta: dimension %q has unknown type %d", d.Name, d.Type)
+		}
+		seen[d.Name] = true
 	}
 	seenM := map[string]bool{}
 	for _, m := range s.Metrics {
@@ -79,7 +111,7 @@ func (s *Schema) fingerprint() uint64 {
 	binary.LittleEndian.PutUint64(n[:], uint64(s.IndexDims))
 	h.Write(n[:])
 	for _, d := range s.Dims {
-		h.Write([]byte(d))
+		h.Write([]byte(d.Name)) // names only: DimType is a capability, not data shape
 		h.Write([]byte{0})
 	}
 	h.Write([]byte{1})
@@ -90,9 +122,28 @@ func (s *Schema) fingerprint() uint64 {
 	return h.Sum64()
 }
 
+// canonNum returns the canonical spelling of a numeric dim value: the
+// shortest round-trip float64 formatting ("1.0"/"01"/"1e0" -> "1"). This IS
+// the identity form for numeric dims — every write and query boundary
+// rewrites values through it, so equality, IN, Range, dedup and group-by
+// keys all agree on the number, not the spelling. Non-finite and
+// unparseable values are rejected (ok == false).
+func canonNum(s string) (string, bool) {
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+		return "", false
+	}
+	return strconv.FormatFloat(v, 'g', -1, 64), true
+}
+
+// isNumeric reports whether dim i was declared DimNumeric.
+func (s *Schema) isNumeric(i int) bool {
+	return s.Dims[i].Type == DimNumeric
+}
+
 func (s *Schema) dimIndex(name string) int {
 	for i, d := range s.Dims {
-		if d == name {
+		if d.Name == name {
 			return i
 		}
 	}

@@ -164,7 +164,9 @@ func (s *Store) QueryAggs(dst []float64, aggs []Agg, groups [][]Cond) ([]float64
 			}
 			matched := false
 			for gi := range groups {
-				if plans[gi].matchBase(v, r) && (ins.pN[gi] == 0 || ins.matchIns(gi, v.base.dims, r)) {
+				if plans[gi].matchBase(v, r) &&
+					(ins.pN[gi] == 0 || ins.matchIns(gi, v.base.dims, r)) &&
+					(ins.rN[gi] == 0 || ins.matchRanges(gi, v, v.base.dims, r)) {
 					matched = true
 					break
 				}
@@ -188,7 +190,9 @@ func (s *Store) QueryAggs(dst []float64, aggs []Agg, groups [][]Cond) ([]float64
 		}
 		matched := false
 		for gi := range groups {
-			if plans[gi].matchDelta(d, r) && (ins.pN[gi] == 0 || ins.matchIns(gi, d.dims, r)) {
+			if plans[gi].matchDelta(d, r) &&
+				(ins.pN[gi] == 0 || ins.matchIns(gi, d.dims, r)) &&
+				(ins.rN[gi] == 0 || ins.matchRanges(gi, v, d.dims, r)) {
 				matched = true
 				break
 			}
