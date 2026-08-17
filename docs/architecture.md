@@ -49,12 +49,12 @@ Three pillars:
 
 | File | Lines | Responsibility |
 |------|-----:|------|
-| `schema.go` | 135 | `Schema`/`Record`/`Config` definitions and validation, error sentinels, schema fingerprint |
-| `dict.go` | 38 | Bidirectional string ↔ uint32 id dictionary, immutable once published, writers clone first |
+| `schema.go` | 161 | `Schema`/`Record`/`Config` definitions and validation, error sentinels, schema fingerprint |
+| `dict.go` | 53 | String ↔ uint32 id dictionary (+ parsed-value array for numeric dims), immutable once published |
 | `snapshot.go` | 424 | Immutable columnar base; full build (`buildFromRecords`) and merge (`mergeView`/`zipMerge`) |
 | `view.go` | 227 | `view`/`delta` structures; write path `applyDelta` (copy-on-write) |
 | `store.go` | 193 | `Store` facade: atomic pointer, write lock, `Apply`/`Compact`/`ReplaceAll` |
-| `query.go` | 404 | `Cond` (equality + IN), shared planner (`planGroups`), `QueryGroups`, scan budget |
+| `query.go` | 470 | `Cond` (equality/IN/range), shared planner (`planGroups`), `QueryGroups`, scan budget |
 | `agg.go` | 179 | `Agg`/`AggOp` aggregate selection, `QueryAggs` (zero-alloc) |
 | `groupby.go` | 226 | `QueryGroupBy` hash aggregation into a reusable `GroupedResult` |
 | `compactor.go` | 89 | Optional background compaction policy (when to call `Compact`) |
@@ -179,6 +179,18 @@ strings for determinism. Distinct columns in group-by dedup per group
 through one shared seen-(column, group, id) set kept on the result. Its allocations are O(result groups) per call and
 amortize on a reused result — the one documented exception to the
 zero-allocation rule.
+
+Range conditions (`Cond.Range`, numeric dims only) piggyback on the same
+machinery. On dims declared `DimNumeric` (`Dim.Type`), identity is the number:
+every write boundary (build, merge, Apply) canonicalizes values to the
+shortest round-trip spelling before dictionary insertion (rejecting
+non-numeric input), and the query boundary canonicalizes condition values
+into a stack buffer looked up allocation-free. The dictionaries carry a
+parallel `vals []float64`, so a range check at query time is an id lookup
+plus two float comparisons — no dictionary scan, no bitset, no allocation.
+The snapshot format is untouched (vals re-derived on load), and loading
+validates that a numeric dim's stored entries are canonical, refusing
+snapshots written before the dim was declared numeric.
 
 IN conditions (`Cond.In`) are resolved into a per-query id pool (`queryIns`)
 rather than into `groupPlan`, and checked by `matchIns` at the call sites

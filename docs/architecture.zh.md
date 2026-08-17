@@ -39,12 +39,12 @@
 
 | 文件 | 行数 | 职责 |
 |------|-----:|------|
-| `schema.go` | 135 | `Schema`/`Record`/`Config` 定义与校验,错误哨兵,schema 指纹 |
-| `dict.go` | 38 | 字符串 ↔ uint32 id 双向字典,发布后不可变,写者先 clone |
+| `schema.go` | 161 | `Schema`/`Record`/`Config` 定义与校验,错误哨兵,schema 指纹 |
+| `dict.go` | 53 | 字符串 ↔ uint32 id 字典(数值维附带解析值数组),发布后不可变 |
 | `snapshot.go` | 424 | 不可变列式基底;全量构建(`buildFromRecords`)与归并(`mergeView`/`zipMerge`) |
 | `view.go` | 227 | `view`/`delta` 结构;写路径 `applyDelta`(copy-on-write) |
 | `store.go` | 193 | `Store` 门面:原子指针、写锁、`Apply`/`Compact`/`ReplaceAll` |
-| `query.go` | 404 | `Cond`(等值 + IN),共享规划器(`planGroups`),`QueryGroups`,扫描预算 |
+| `query.go` | 470 | `Cond`(等值/IN/范围),共享规划器(`planGroups`),`QueryGroups`,扫描预算 |
 | `agg.go` | 179 | `Agg`/`AggOp` 聚合选择,`QueryAggs`(零分配) |
 | `groupby.go` | 226 | `QueryGroupBy` 哈希聚合,产出可复用的 `GroupedResult` |
 | `compactor.go` | 89 | 可选后台压实策略(何时调 `Compact`) |
@@ -145,6 +145,14 @@ Min/Max 从首个命中行初始化,Count/Avg 派生自共享的行计数器 —
 排序以保证确定性。group-by 中的 distinct 列经由挂在结果上的一个共享
 seen-(列, 组, id) 集合逐组去重。它的分配是每次调用 O(结果组数),并在复用的结果上摊销 ——
 这是零分配规则唯一的文档化例外。
+
+范围条件(`Cond.Range`,仅限数值维)搭载在同一套机制上。在声明为 `DimNumeric`
+(`Dim.Type`)的维度上,身份就是数字:每个写入边界(构建、归并、Apply)都在字典插入前把值
+规范化为最短往返表示的拼写(并拒绝非数值输入),查询边界则把条件值规范化进一个
+栈上缓冲区,零分配地完成查找。字典附带一个平行的 `vals []float64`,因此查询时
+一次范围检查就是一次 id 查找加两次浮点比较 —— 不扫字典、不用位图、零分配。
+快照格式不受影响(vals 在加载时重新推导),但加载时会校验数值维的既有词条均为
+规范拼写,拒绝在该维声明为数值之前写出的快照。
 
 IN 条件(`Cond.In`)被解析进按查询一份的 id 池(`queryIns`)而不是 `groupPlan`,
 并由调用点的 `matchIns` 检查,而不是放进 `matchBase`/`matchDelta` 内部。两处摆放

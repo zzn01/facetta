@@ -13,7 +13,11 @@ integration contract.
 ```go
 // Create a store with the schema
 store, err := New(Schema{
-    Dims:      []string{"source", "account", "publisher", "country", "os"},
+    Dims: []facetta.Dim{
+        {Name: "source"}, {Name: "account"}, {Name: "publisher"},
+        {Name: "country"}, {Name: "os"},
+        {Name: "hour", Type: facetta.DimNumeric}, // numeric: rangeable, identity = the number
+    },
     IndexDims: 3,
     Metrics:   []string{"impressions", "clicks"},
 }, Config{
@@ -69,7 +73,7 @@ rebuild) forgets the tuple's `UpdatedAt` watermark, so an out-of-order
 deliberate — remembering every reclaimed tombstone forever would unbound
 memory — and falls in the same drift category `ReplaceAll` repairs.
 
-## Aggregates, IN conditions and GROUP BY
+## Aggregates, IN/range conditions and GROUP BY
 
 Beyond the sum-everything `Query`/`QueryGroups`, three richer query forms
 share the same planner, union semantics (each row counted once across
@@ -84,10 +88,12 @@ sums, err := store.QueryAggs(buf, []facetta.Agg{
     {Dim: "publisher", Op: facetta.AggDistinct},  // COUNT(DISTINCT publisher)
 }, groups)
 
-// IN condition: dimension equals ANY listed value.
+// IN condition: dimension equals ANY listed value. Range condition:
+// numeric interval on a dim declared with Type: DimNumeric.
 groups := [][]facetta.Cond{{
     {Dim: "source", Value: "src7"},
     {Dim: "os", In: []string{"ios", "android"}},
+    {Dim: "hour", Range: &facetta.Range{Min: 9, Max: 17}},
 }}
 
 // GROUP BY: aggregates per distinct combination of the by dims.
@@ -119,6 +125,21 @@ Semantics and limits:
   conditions degrades to a full scan (fail-fast guarded by `MaxScanRows`).
   For indexed multi-value queries use one group per value instead. Caps: 16
   values per condition, 16 IN conditions / 128 resolved values per query.
+- **`Cond.Range`** is a closed numeric interval (`math.Inf` for open ends) on
+  a dim declared with `Type: DimNumeric` — encode times as unix timestamps.
+  **On numeric dims, identity is the number**: values are canonicalized at
+  every write and query boundary, so `"1.0"`, `"01"` and `"1e0"` are the same
+  row, the same dictionary entry and the group-by key `"1"` (integers exact
+  up to 2^53); equality, IN, ranges and dedup all agree. Non-numeric values
+  are rejected explicitly — ingestion and conditions error rather than
+  silently mismatch. Parsing happens once per dictionary entry at insertion,
+  never on the query path: a range check is two float comparisons per row,
+  zero allocations (canonicalizing condition values is allocation-free too).
+  Like IN, ranges filter rows but do not join index-prefix planning. The
+  snapshot format is unchanged; a snapshot holding non-canonical values for
+  a numeric dim is refused at load and falls back to a full pull. `Dim.Type`
+  is where future per-dimension semantics will slot in — the schema declares
+  each dimension as a struct, not a name in parallel tag lists.
 - **`QueryGroupBy`** writes into a reusable `GroupedResult` (flat row-major
   `Keys`/`Aggs`, groups sorted lexicographically — deterministic output).
   It is the one query entry point with a relaxed allocation contract:
@@ -267,6 +288,7 @@ Measured on an Intel Core i9-9880H (2.30GHz), `go test -bench . -benchmem -run x
 | `BenchmarkQueryAggsIndexed1M` (as the indexed query, 4 aggregate columns) | ~0.9 µs/op | 0 B/op | 0 allocs/op |
 | `BenchmarkGroupByIndexed1M` (~20k-row indexed range grouped by an 8-value dim, reused `GroupedResult`) | ~1.1 ms/op | ~89 B/op | 10 allocs/op |
 | `BenchmarkQueryAggsDistinct1M` (~20k-row indexed range, COUNT(DISTINCT publisher) + sum) | ~0.6 ms/op | 4 KB/op (one ~30k-bit bitmap) | 1 alloc/op |
+| `BenchmarkQueryRangeFilter1M` (~20k-row indexed range + numeric range condition) | ~0.4 ms/op | 0 B/op | 0 allocs/op |
 | `BenchmarkApply1K` (1000-record batch onto 1M rows) | ~4.5 ms/op averaged as the resident delta approaches the 50k compaction threshold (Apply copies the delta columns; the tuple index is map-cloned, not rebuilt) | ~3.8 MB/op | ~1.1k allocs/op |
 | `BenchmarkApplySmallOnLargeDelta` (10-record batch onto a ~100k-row delta) | ~2.4 ms/op (the O(DeltaRows) column copy dominates) | ~8.9 MB/op | ~283 allocs/op |
 | `BenchmarkReplaceAll1M` (full reconcile build, 1M records) | ~570 ms/op | ~202 MB/op | ~490 allocs/op |
