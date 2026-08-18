@@ -17,7 +17,7 @@ func TestEquivalenceRandomized(t *testing.T) {
 		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
 			rng := rand.New(rand.NewSource(seed))
 			sc := testSchema()
-			sc.Dims[3].Type = DimNumeric // country
+			sc.Dims[3].Type = DimInt // country
 			// odd seeds gate dictionary compaction so both merge paths
 			// (id-stable and renumbering) run under the random workload
 			cfg := Config{}
@@ -51,7 +51,7 @@ func TestEquivalenceRandomized(t *testing.T) {
 								n := rng.Intn(card + 1)
 								switch rng.Intn(3) {
 								case 0:
-									return fmt.Sprintf("%d.0", n)
+									return fmt.Sprintf("+%d", n)
 								case 1:
 									return fmt.Sprintf("%02d", n)
 								default:
@@ -70,8 +70,8 @@ func TestEquivalenceRandomized(t *testing.T) {
 							groups[g] = append(groups[g], Cond{Dim: sc.Dims[d].Name, In: in})
 						case rng.Intn(4) == 0 && sc.Dims[d].Name == "country":
 							// numeric dim: sometimes a range (possibly inverted -> empty)
-							lo := float64(rng.Intn(card + 2))
-							hi := float64(rng.Intn(card + 2))
+							lo := int64(rng.Intn(card + 2))
+							hi := int64(rng.Intn(card + 2))
 							groups[g] = append(groups[g], Cond{Dim: "country", Range: &Range{Min: lo, Max: hi}})
 						default:
 							groups[g] = append(groups[g], Cond{Dim: sc.Dims[d].Name, Value: val()})
@@ -164,7 +164,7 @@ func TestEquivalenceRandomized(t *testing.T) {
 					n := rng.Intn(card + 1)
 					switch rng.Intn(3) {
 					case 0:
-						r.Dims[3] = fmt.Sprintf("%d.0", n)
+						r.Dims[3] = fmt.Sprintf("+%d", n)
 					case 1:
 						r.Dims[3] = fmt.Sprintf("%02d", n)
 					default:

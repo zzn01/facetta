@@ -25,16 +25,13 @@ func newRefTable(sc Schema) *refTable {
 	return &refTable{sc: sc, data: map[string]Record{}, now: time.Now}
 }
 
-// refCanon is the oracle's independent canonical numeric spelling.
+// refCanon is the oracle's independent canonical integer spelling.
 func refCanon(s string) (string, bool) {
-	v, err := strconv.ParseFloat(s, 64)
-	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
 		return "", false
 	}
-	if v == 0 {
-		v = 0 // collapse -0 into +0, mirroring the engine
-	}
-	return strconv.FormatFloat(v, 'g', -1, 64), true
+	return strconv.FormatInt(v, 10), true
 }
 
 // canonDims returns a copy of dims with numeric dims rewritten to their
@@ -42,7 +39,7 @@ func refCanon(s string) (string, bool) {
 func (t *refTable) canonDims(dims []string) []string {
 	out := slices.Clone(dims)
 	for i := range out {
-		if t.sc.isNumeric(i) {
+		if t.sc.isInt(i) {
 			if cs, ok := refCanon(out[i]); ok {
 				out[i] = cs
 			}
@@ -111,14 +108,14 @@ func (t *refTable) matches(r Record, g []Cond) bool {
 			return false
 		}
 		if c.Range != nil {
-			v, err := strconv.ParseFloat(r.Dims[di], 64)
-			if err != nil || !(v >= c.Range.Min && v <= c.Range.Max) {
+			v, err := strconv.ParseInt(r.Dims[di], 10, 64)
+			if err != nil || v < c.Range.Min || v > c.Range.Max {
 				return false
 			}
 		} else if len(c.In) > 0 {
 			ok := false
 			for _, v := range c.In {
-				if t.sc.isNumeric(di) {
+				if t.sc.isInt(di) {
 					if cs, okc := refCanon(v); okc {
 						v = cs
 					}
@@ -133,7 +130,7 @@ func (t *refTable) matches(r Record, g []Cond) bool {
 			}
 		} else {
 			cv := c.Value
-			if t.sc.isNumeric(di) {
+			if t.sc.isInt(di) {
 				if cs, okc := refCanon(cv); okc {
 					cv = cs
 				}

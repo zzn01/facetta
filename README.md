@@ -16,7 +16,7 @@ store, err := New(Schema{
     Dims: []facetta.Dim{
         {Name: "source"}, {Name: "account"}, {Name: "publisher"},
         {Name: "country"}, {Name: "os"},
-        {Name: "hour", Type: facetta.DimNumeric}, // numeric: rangeable, identity = the number
+        {Name: "hour", Type: facetta.DimInt}, // integer: rangeable, identity = the number
     },
     IndexDims: 3,
     Metrics:   []string{"impressions", "clicks"},
@@ -89,7 +89,7 @@ sums, err := store.QueryAggs(buf, []facetta.Agg{
 }, groups)
 
 // IN condition: dimension equals ANY listed value. Range condition:
-// numeric interval on a dim declared with Type: DimNumeric.
+// integer interval on a dim declared with Type: DimInt.
 groups := [][]facetta.Cond{{
     {Dim: "source", Value: "src7"},
     {Dim: "os", In: []string{"ios", "android"}},
@@ -125,21 +125,25 @@ Semantics and limits:
   conditions degrades to a full scan (fail-fast guarded by `MaxScanRows`).
   For indexed multi-value queries use one group per value instead. Caps: 16
   values per condition, 16 IN conditions / 128 resolved values per query.
-- **`Cond.Range`** is a closed numeric interval (`math.Inf` for open ends) on
-  a dim declared with `Type: DimNumeric` — encode times as unix timestamps.
-  **On numeric dims, identity is the number**: values are canonicalized at
-  every write and query boundary, so `"1.0"`, `"01"` and `"1e0"` are the same
-  row, the same dictionary entry and the group-by key `"1"` (integers exact
-  up to 2^53); equality, IN, ranges and dedup all agree. Non-numeric values
-  are rejected explicitly — ingestion and conditions error rather than
-  silently mismatch. Parsing happens once per dictionary entry at insertion,
-  never on the query path: a range check is two float comparisons per row,
-  zero allocations (canonicalizing condition values is allocation-free too).
-  Like IN, ranges filter rows but do not join index-prefix planning. The
-  snapshot format is unchanged; a snapshot holding non-canonical values for
-  a numeric dim is refused at load and falls back to a full pull. `Dim.Type`
-  is where future per-dimension semantics will slot in — the schema declares
-  each dimension as a struct, not a name in parallel tag lists.
+- **`Cond.Range`** is a closed integer interval (`math.MinInt64`/`MaxInt64`
+  for open ends) on a dim declared with `Type: DimInt` — encode times as
+  unix timestamps, fractional buckets as minor units (the same discipline as
+  exact metrics). **On integer dims, identity is the int64 value**: spellings
+  are canonicalized at every write and query boundary, so `"01"` and `"+1"`
+  are the same row, the same dictionary entry and the group-by key `"1"`,
+  exact over the full int64 range — dimension identity has no float
+  precision cliff (nanosecond timestamps are safe). Non-integer values
+  (`"1.5"`, `"abc"`) are rejected explicitly — ingestion and conditions
+  error rather than silently mismatch. Parsing happens once per dictionary
+  entry at insertion, never on the query path: a range check is two integer
+  comparisons per row, zero allocations (canonicalizing condition values is
+  allocation-free too). Like IN, ranges filter rows but do not join
+  index-prefix planning. The snapshot format is unchanged; a snapshot
+  holding non-canonical values for an integer dim is refused at load and
+  falls back to a full pull. `Dim.Type` is where future per-dimension
+  semantics will slot in (a `DimFloat` would be an additive change) — the
+  schema declares each dimension as a struct, not a name in parallel tag
+  lists.
 - **`QueryGroupBy`** writes into a reusable `GroupedResult` (flat row-major
   `Keys`/`Aggs`, groups sorted lexicographically — deterministic output).
   It is the one query entry point with a relaxed allocation contract:

@@ -2,24 +2,22 @@ package facetta
 
 import (
 	"maps"
-	"math"
 	"slices"
 	"strconv"
 )
 
 // dict maps dimension strings to dense uint32 ids. Immutable once published
-// in a view; writers clone before extending. Dictionaries of dims declared with
-// DimNumeric type hold canonical numeric spellings only (enforced at the
-// write/load boundaries) and carry vals, a parallel array of each entry's
-// parsed float64, so range conditions cost two float comparisons per row at
-// query time: parsing happens once per dictionary entry, on insertion, never
-// on the query path. (The NaN fallback below is defensive; canonical entries
-// always parse.)
+// in a view; writers clone before extending. Dictionaries of dims declared
+// DimInt hold canonical integer spellings only (enforced at the write/load
+// boundaries) and carry vals, a parallel array of each entry's parsed int64,
+// so range conditions cost two integer comparisons per row at query time:
+// parsing happens once per dictionary entry, on insertion, never on the
+// query path.
 type dict struct {
 	ids     map[string]uint32
 	strs    []string
 	numeric bool
-	vals    []float64 // [id] parsed value; only when numeric
+	vals    []int64 // [id] parsed value; only when numeric
 }
 
 func newDict(numeric bool) *dict {
@@ -34,10 +32,8 @@ func (d *dict) getOrAdd(s string) uint32 {
 	d.ids[s] = id
 	d.strs = append(d.strs, s)
 	if d.numeric {
-		v, err := strconv.ParseFloat(s, 64)
-		if err != nil {
-			v = math.NaN() // unparseable: matches no range, still matchable by equality
-		}
+		// canonical entries always parse; err is unreachable by construction
+		v, _ := strconv.ParseInt(s, 10, 64)
 		d.vals = append(d.vals, v)
 	}
 	return id

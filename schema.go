@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
-	"math"
 	"strconv"
 	"time"
 )
@@ -48,17 +47,18 @@ const (
 	// DimString treats values as opaque labels; equality and IN only.
 	// The zero value, so plain Dim{Name: "..."} declares a string dim.
 	DimString DimType = iota
-	// DimNumeric declares values to be numbers (encode times as unix
-	// timestamps), enabling Cond.Range. On these dims IDENTITY IS THE
-	// NUMBER: every value is canonicalized at the write and query
-	// boundaries ("1.0"/"01"/"1e0" are one row, one dictionary entry, one
-	// group-by key "1"; integers exact up to 2^53). Non-numeric or
-	// non-finite values are rejected — Apply/ReplaceAll and conditions
-	// error instead of silently mismatching. The snapshot format and the
-	// schema fingerprint are unaffected by the type; snapshots holding
-	// non-canonical values for a numeric dim are refused at load
-	// (full-pull fallback).
-	DimNumeric
+	// DimInt declares values to be int64 integers (encode times as unix
+	// timestamps, fractional buckets as minor units — the same discipline
+	// as exact metrics), enabling Cond.Range. On these dims IDENTITY IS
+	// THE INTEGER: every value is canonicalized at the write and query
+	// boundaries ("01"/"+1" are one row, one dictionary entry, one
+	// group-by key "1"), exact over the full int64 range — no float
+	// precision cliff. Values that are not integers ("1.5", "abc") are
+	// rejected: Apply/ReplaceAll and conditions error instead of silently
+	// mismatching. The snapshot format and the schema fingerprint are
+	// unaffected by the type; snapshots holding non-canonical values for
+	// an integer dim are refused at load (full-pull fallback).
+	DimInt
 )
 
 // Dim declares one dimension: its name and value semantics. Future per-dim
@@ -89,7 +89,7 @@ func (s *Schema) validate() error {
 		if d.Name == "" || seen[d.Name] {
 			return fmt.Errorf("facetta: empty or duplicate dimension %q", d.Name)
 		}
-		if d.Type > DimNumeric {
+		if d.Type > DimInt {
 			return fmt.Errorf("facetta: dimension %q has unknown type %d", d.Name, d.Type)
 		}
 		seen[d.Name] = true
@@ -122,26 +122,23 @@ func (s *Schema) fingerprint() uint64 {
 	return h.Sum64()
 }
 
-// canonNum returns the canonical spelling of a numeric dim value: the
-// shortest round-trip float64 formatting ("1.0"/"01"/"1e0" -> "1"). This IS
-// the identity form for numeric dims — every write and query boundary
-// rewrites values through it, so equality, IN, Range, dedup and group-by
-// keys all agree on the number, not the spelling. Non-finite and
-// unparseable values are rejected (ok == false).
-func canonNum(s string) (string, bool) {
-	v, err := strconv.ParseFloat(s, 64)
-	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+// canonInt returns the canonical spelling of an integer dim value: plain
+// base-10 int64 formatting ("01"/"+1"/"-0" -> "1"/"1"/"0"). This IS the
+// identity form for integer dims — every write and query boundary rewrites
+// values through it, so equality, IN, Range, dedup and group-by keys all
+// agree on the integer, not the spelling, exactly over the full int64
+// range. Non-integer values are rejected (ok == false).
+func canonInt(s string) (string, bool) {
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
 		return "", false
 	}
-	if v == 0 {
-		v = 0 // collapse -0 into +0: they compare equal, so one identity
-	}
-	return strconv.FormatFloat(v, 'g', -1, 64), true
+	return strconv.FormatInt(v, 10), true
 }
 
-// isNumeric reports whether dim i was declared DimNumeric.
-func (s *Schema) isNumeric(i int) bool {
-	return s.Dims[i].Type == DimNumeric
+// isInt reports whether dim i was declared DimInt.
+func (s *Schema) isInt(i int) bool {
+	return s.Dims[i].Type == DimInt
 }
 
 func (s *Schema) dimIndex(name string) int {

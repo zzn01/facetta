@@ -50,7 +50,7 @@ Three pillars:
 | File | Lines | Responsibility |
 |------|-----:|------|
 | `schema.go` | 161 | `Schema`/`Record`/`Config` definitions and validation, error sentinels, schema fingerprint |
-| `dict.go` | 53 | String ↔ uint32 id dictionary (+ parsed-value array for numeric dims), immutable once published |
+| `dict.go` | 53 | String ↔ uint32 id dictionary (+ parsed-value array for integer dims), immutable once published |
 | `snapshot.go` | 424 | Immutable columnar base; full build (`buildFromRecords`) and merge (`mergeView`/`zipMerge`) |
 | `view.go` | 227 | `view`/`delta` structures; write path `applyDelta` (copy-on-write) |
 | `store.go` | 193 | `Store` facade: atomic pointer, write lock, `Apply`/`Compact`/`ReplaceAll` |
@@ -180,17 +180,18 @@ through one shared seen-(column, group, id) set kept on the result. Its allocati
 amortize on a reused result — the one documented exception to the
 zero-allocation rule.
 
-Range conditions (`Cond.Range`, numeric dims only) piggyback on the same
-machinery. On dims declared `DimNumeric` (`Dim.Type`), identity is the number:
-every write boundary (build, merge, Apply) canonicalizes values to the
-shortest round-trip spelling before dictionary insertion (rejecting
-non-numeric input), and the query boundary canonicalizes condition values
-into a stack buffer looked up allocation-free. The dictionaries carry a
-parallel `vals []float64`, so a range check at query time is an id lookup
-plus two float comparisons — no dictionary scan, no bitset, no allocation.
-The snapshot format is untouched (vals re-derived on load), and loading
-validates that a numeric dim's stored entries are canonical, refusing
-snapshots written before the dim was declared numeric.
+Range conditions (`Cond.Range`, integer dims only) piggyback on the same
+machinery. On dims declared `DimInt` (`Dim.Type`), identity is the int64
+value: every write boundary (build, merge, Apply) canonicalizes spellings to
+plain base-10 form before dictionary insertion (rejecting non-integer
+input), and the query boundary canonicalizes condition values into a stack
+buffer looked up allocation-free. The dictionaries carry a parallel
+`vals []int64`, so a range check at query time is an id lookup plus two
+integer comparisons — no dictionary scan, no bitset, no allocation, and no
+float precision cliff anywhere in dimension identity. The snapshot format
+is untouched (vals re-derived on load), and loading validates that an
+integer dim's stored entries are canonical, refusing snapshots written
+before the dim was declared DimInt.
 
 IN conditions (`Cond.In`) are resolved into a per-query id pool (`queryIns`)
 rather than into `groupPlan`, and checked by `matchIns` at the call sites

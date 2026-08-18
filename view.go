@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"maps"
-	"math"
 	"slices"
 	"sort"
 	"strconv"
@@ -44,7 +43,7 @@ type view struct {
 func newView(base *snapshot) *view {
 	extras := make([]*dict, len(base.sc.Dims))
 	for i := range extras {
-		extras[i] = newDict(base.sc.isNumeric(i))
+		extras[i] = newDict(base.sc.isInt(i))
 	}
 	return &view{base: base, delta: emptyDelta(base.sc), extras: extras}
 }
@@ -59,21 +58,18 @@ func (v *view) lookupID(dim int, s string) (uint32, bool) {
 	return 0, false
 }
 
-// lookupNumID resolves a numeric dim's condition value: parse it, render the
-// canonical spelling into a stack buffer, and look that up allocation-free
-// (map indexing with string(bytes) does not allocate). valid is false when
-// the value does not parse as a finite number — a caller error on a numeric
-// dim, reported rather than silently matching nothing.
+// lookupNumID resolves an integer dim's condition value: parse it, render
+// the canonical spelling into a stack buffer, and look that up
+// allocation-free (map indexing with string(bytes) does not allocate).
+// valid is false when the value does not parse as an int64 — a caller error
+// on an integer dim, reported rather than silently matching nothing.
 func (v *view) lookupNumID(dim int, s string) (id uint32, found, valid bool) {
-	f, err := strconv.ParseFloat(s, 64)
-	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+	f, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
 		return 0, false, false
 	}
-	if f == 0 {
-		f = 0 // collapse -0 into +0, mirroring canonNum
-	}
-	var buf [32]byte
-	b := strconv.AppendFloat(buf[:0], f, 'g', -1, 64)
+	var buf [24]byte
+	b := strconv.AppendInt(buf[:0], f, 10)
 	if id, ok := v.base.dicts[dim].lookupB(b); ok {
 		return id, true, true
 	}
@@ -190,10 +186,10 @@ func (v *view) applyDelta(sc *Schema, recs []Record, ttlCutoff int64, capBlocked
 		allInBase := true
 		for d := range nd {
 			sv := rec.Dims[d]
-			if sc.isNumeric(d) {
-				cs, ok := canonNum(sv)
+			if sc.isInt(d) {
+				cs, ok := canonInt(sv)
 				if !ok {
-					return nil, dropped, fmt.Errorf("facetta: record %d: non-numeric value %q for numeric dimension %q", i, sv, sc.Dims[d].Name)
+					return nil, dropped, fmt.Errorf("facetta: record %d: non-integer value %q for integer dimension %q", i, sv, sc.Dims[d].Name)
 				}
 				sv = cs
 			}

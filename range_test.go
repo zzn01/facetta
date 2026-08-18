@@ -13,7 +13,7 @@ import (
 // numericSchema is testSchema with country declared numeric.
 func numericSchema() Schema {
 	sc := testSchema()
-	sc.Dims[3].Type = DimNumeric // country
+	sc.Dims[3].Type = DimInt // country
 	return sc
 }
 
@@ -50,17 +50,17 @@ func TestCondRangeBasics(t *testing.T) {
 		{{{Dim: "country", Range: &Range{Min: 10, Max: 90}}}},
 		// inclusive bounds: exactly the endpoints
 		{{{Dim: "country", Range: &Range{Min: 25, Max: 25}}}},
-		// open-ended via ±Inf
-		{{{Dim: "country", Range: &Range{Min: 100, Max: math.Inf(1)}}}},
-		{{{Dim: "country", Range: &Range{Min: math.Inf(-1), Max: 24}}}},
+		// open-ended via the int64 extremes
+		{{{Dim: "country", Range: &Range{Min: 100, Max: math.MaxInt64}}}},
+		{{{Dim: "country", Range: &Range{Min: math.MinInt64, Max: 24}}}},
 		// combined with an indexed equality prefix
 		{{{Dim: "source", Value: "s1"}, {Dim: "country", Range: &Range{Min: 20, Max: 100}}}},
 		// combined with IN
 		{{{Dim: "os", In: []string{"ios"}}, {Dim: "country", Range: &Range{Min: 0, Max: 200}}}},
 		// range matching nothing
 		{{{Dim: "country", Range: &Range{Min: 1000, Max: 2000}}}},
-		// NaN bounds match nothing
-		{{{Dim: "country", Range: &Range{Min: math.NaN(), Max: math.NaN()}}}},
+		// inverted bounds match nothing
+		{{{Dim: "country", Range: &Range{Min: 20, Max: 10}}}},
 	}
 	var buf []float64
 	for i, groups := range cases {
@@ -131,7 +131,7 @@ func TestCondRangeSurvivesCompactAndSnapshot(t *testing.T) {
 func TestCondRangeLeadingDimFullScan(t *testing.T) {
 	// numeric leading index dim: range on it cannot use the prefix
 	sc := Schema{
-		Dims:      []Dim{{Name: "hour", Type: DimNumeric}, {Name: "account"}},
+		Dims:      []Dim{{Name: "hour", Type: DimInt}, {Name: "account"}},
 		IndexDims: 1,
 		Metrics:   []string{"visits"},
 	}
@@ -215,8 +215,8 @@ func TestQueryRangeZeroAlloc(t *testing.T) {
 	buf := make([]float64, 0, 2)
 	groups := [][]Cond{
 		{{Dim: "source", Value: "s1"}, {Dim: "country", Range: &Range{Min: 0, Max: 40}}},
-		{{Dim: "country", Value: "40.0"}},              // non-canonical spelling
-		{{Dim: "country", In: []string{"10", "25.0"}}}, // mixed spellings
+		{{Dim: "country", Value: "+40"}},              // non-canonical spelling
+		{{Dim: "country", In: []string{"10", "025"}}}, // mixed spellings
 	}
 	allocs := testing.AllocsPerRun(100, func() {
 		var err error
@@ -248,8 +248,8 @@ func TestNumericDimCanonicalIdentity(t *testing.T) {
 	s := numericStore(t, numericRecords())
 	rt := newRefTable(numericSchema())
 	rt.apply(numericRecords())
-	// same tuple, different spelling: "10.0" must upsert the "10" row
-	up := []Record{rec(ts(200), []float64{11, 2}, "s1", "a1", "p1", "10.0", "ios")}
+	// same tuple, different spelling: "010" must upsert the "10" row
+	up := []Record{rec(ts(200), []float64{11, 2}, "s1", "a1", "p1", "010", "ios")}
 	if err := s.Apply(up); err != nil {
 		t.Fatal(err)
 	}
@@ -259,7 +259,7 @@ func TestNumericDimCanonicalIdentity(t *testing.T) {
 		t.Fatalf("rows+delta = %d, want %d (upsert must not create a new identity)", got, len(numericRecords())+1)
 	}
 	// every spelling of the same number finds the same row
-	for _, spell := range []string{"10", "10.0", "010", "1e1"} {
+	for _, spell := range []string{"10", "+10", "010", "0010"} {
 		got, err := s.Query(nil, []Cond{{Dim: "country", Value: spell}})
 		if err != nil {
 			t.Fatalf("%q: %v", spell, err)
@@ -273,7 +273,7 @@ func TestNumericDimCanonicalIdentity(t *testing.T) {
 	}
 	assertGroupsEqual(t, groupedToMap(&res, 1, 1), rt.queryGroupBy([]string{"country"}, []Agg{{Op: AggCount}}, [][]Cond{{}}))
 	for i := 0; i < res.N; i++ {
-		if k := res.Keys[i]; k == "10.0" || k == "010" {
+		if k := res.Keys[i]; k == "+10" || k == "010" {
 			t.Fatalf("non-canonical group key %q", k)
 		}
 	}
@@ -287,10 +287,10 @@ func TestNumericDimNegativeZero(t *testing.T) {
 	if err := s.Apply([]Record{rec(ts(200), []float64{7, 1}, "s1", "a1", "p1", "-0", "ios")}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Apply([]Record{rec(ts(300), []float64{9, 2}, "s1", "a1", "p1", "0.0", "ios")}); err != nil {
+	if err := s.Apply([]Record{rec(ts(300), []float64{9, 2}, "s1", "a1", "p1", "+0", "ios")}); err != nil {
 		t.Fatal(err)
 	}
-	for _, spell := range []string{"0", "-0", "0.0", "-0.0"} {
+	for _, spell := range []string{"0", "-0", "+0", "00"} {
 		got, err := s.Query(nil, []Cond{{Dim: "country", Value: spell}})
 		if err != nil {
 			t.Fatalf("%q: %v", spell, err)
@@ -319,10 +319,10 @@ func TestNumericDimRejectsBadValues(t *testing.T) {
 	if err := s.ReplaceAll(bad); err == nil {
 		t.Fatal("ReplaceAll accepted a non-numeric value on a numeric dim")
 	}
-	for _, v := range []string{"NaN", "Inf", "-Inf"} {
+	for _, v := range []string{"NaN", "Inf", "-Inf", "1.5", "1.0", "1e3"} {
 		r := []Record{rec(ts(100), []float64{1, 1}, "s1", "a1", "p1", v, "ios")}
 		if err := s.Apply(r); err == nil {
-			t.Fatalf("Apply accepted non-finite value %q", v)
+			t.Fatalf("Apply accepted non-integer value %q", v)
 		}
 	}
 }

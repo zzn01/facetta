@@ -18,16 +18,17 @@ type Cond struct {
 	// value instead. At most 16 values per condition, 16 IN conditions and
 	// 128 resolved values per query.
 	In []string
-	// Range, when non-nil, matches rows whose Dim value (a number — see
-	// DimNumeric: identity on such dims IS the number) falls within
-	// [Min, Max] (inclusive; use math.Inf for open ends). Mutually exclusive
-	// with Value and In. Like In, Range filters rows but does not join
-	// index-prefix planning. At most 16 range conditions per query.
+	// Range, when non-nil, matches rows whose Dim value (an int64 — see
+	// DimInt: identity on such dims IS the integer) falls within
+	// [Min, Max] (inclusive; use math.MinInt64/MaxInt64 for open ends).
+	// Mutually exclusive with Value and In. Like In, Range filters rows but
+	// does not join index-prefix planning. At most 16 range conditions per
+	// query.
 	Range *Range
 }
 
-// Range is a closed numeric interval for Cond.Range.
-type Range struct{ Min, Max float64 }
+// Range is a closed integer interval for Cond.Range.
+type Range struct{ Min, Max int64 }
 
 var (
 	errBadGroupCount     = errors.New("facetta: need 1..16 filter groups")
@@ -68,8 +69,8 @@ type queryIns struct {
 	rOff    [maxGroups]uint8
 	rN      [maxGroups]uint8
 	rDims   [maxRanges]uint8
-	rMin    [maxRanges]float64
-	rMax    [maxRanges]float64
+	rMin    [maxRanges]int64
+	rMax    [maxRanges]int64
 }
 
 type groupPlan struct {
@@ -103,8 +104,8 @@ func (v *view) plan(sc *Schema, g []Cond, p *groupPlan, ins *queryIns) error {
 			if c.Value != "" || len(c.In) > 0 {
 				return errCondRangeConflict
 			}
-			if !sc.isNumeric(di) {
-				return fmt.Errorf("facetta: dimension %q is not DimNumeric", c.Dim)
+			if !sc.isInt(di) {
+				return fmt.Errorf("facetta: dimension %q is not DimInt", c.Dim)
 			}
 			if ins.nRanges == maxRanges {
 				return errTooManyRanges
@@ -127,11 +128,11 @@ func (v *view) plan(sc *Schema, g []Cond, p *groupPlan, ins *queryIns) error {
 			for _, val := range c.In {
 				var id uint32
 				var ok bool
-				if sc.isNumeric(di) {
+				if sc.isInt(di) {
 					var valid bool
 					id, ok, valid = v.lookupNumID(di, val)
 					if !valid {
-						return fmt.Errorf("facetta: non-numeric value %q for numeric dimension %q", val, c.Dim)
+						return fmt.Errorf("facetta: non-integer value %q for integer dimension %q", val, c.Dim)
 					}
 				} else {
 					id, ok = v.lookupID(di, val)
@@ -165,11 +166,11 @@ func (v *view) plan(sc *Schema, g []Cond, p *groupPlan, ins *queryIns) error {
 		}
 		var id uint32
 		var ok bool
-		if sc.isNumeric(di) {
+		if sc.isInt(di) {
 			var valid bool
 			id, ok, valid = v.lookupNumID(di, c.Value)
 			if !valid {
-				return fmt.Errorf("facetta: non-numeric value %q for numeric dimension %q", c.Value, c.Dim)
+				return fmt.Errorf("facetta: non-integer value %q for integer dimension %q", c.Value, c.Dim)
 			}
 		} else {
 			id, ok = v.lookupID(di, c.Value)
@@ -250,14 +251,14 @@ func (q *queryIns) matchRanges(gi int, v *view, dims [][]uint32, r int) bool {
 	for k := off; k < off+int(q.rN[gi]); k++ {
 		d := int(q.rDims[k])
 		id := dims[d][r]
-		var val float64
+		var val int64
 		if n := uint32(v.base.dicts[d].len()); id >= n {
 			val = v.extras[d].vals[id-n]
 		} else {
 			val = v.base.dicts[d].vals[id]
 		}
-		if !(val >= q.rMin[k] && val <= q.rMax[k]) {
-			return false // NaN (unparseable) fails here too
+		if val < q.rMin[k] || val > q.rMax[k] {
+			return false
 		}
 	}
 	return true
