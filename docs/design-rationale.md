@@ -191,29 +191,34 @@ constraint, which drove four decisions:
   seen-triple set instead, and its documented cost grows with unique
   (group, value) pairs — worst case O(matched rows), stated rather than
   hidden.
-- **Numeric dims: identity is the number, enforced by canonicalization.**
-  Range predicates over string-spelled numbers initially shipped with a
-  split personality — identity by spelling, ranges by parsed value — and it
-  was rejected in review: `"1"` and `"1.0"` being different rows that the
-  same range counts twice is wrong. The fix is not a typed column (8 bytes
-  per row, and index packing still needs a dictionary) but canonical
-  encoding: every write boundary rewrites numeric-dim values to the shortest
-  round-trip spelling (rejecting non-numeric input outright, the same way
+- **Integer dims: identity is the int64 value, enforced by
+  canonicalization.** Range predicates over string-spelled numbers initially
+  shipped with a split personality — identity by spelling, ranges by parsed
+  value — and were rejected in review: `"1"` and `"1.0"` being different
+  rows that the same range counts twice is wrong. The fix is not a typed
+  column (8 bytes per row, and index packing still needs a dictionary) but
+  canonical encoding: every write boundary rewrites integer-dim values to
+  plain base-10 form (rejecting non-integer input outright, the same way
   arity mismatches are rejected), and every query boundary canonicalizes
   condition values — allocation-free, via a stack-rendered key — so
-  equality, IN, ranges, dedup and group-by keys all agree on the number.
-  Ordered dictionaries were rejected because compaction's renumbering must
-  stay monotonic in the old ids (value-ordering would force a full re-sort
-  per compaction); per-query dictionary scans were rejected as milliseconds
-  of parsing per call. Instead the dictionary carries a parsed `vals` array
-  maintained at insertion, making a range check two float comparisons per
-  row. Time support is by encoding (unix timestamps), not layout parsing.
-  The type lives on the dimension declaration itself (`Dim{Name, Type}` —
-  one struct per dim rather than parallel tag lists, so future per-dim
-  attributes are additive). `DimType` stays out of the schema fingerprint;
-  loading validates
-  canonicality instead, so a snapshot written before the declaration is
-  refused into the normal full-pull fallback.
+  equality, IN, ranges, dedup and group-by keys all agree on the integer.
+  int64 was chosen over float64 deliberately: dimension identity demands
+  exactness, and float identity has a silent precision cliff above 2^53
+  where distinct values (nanosecond timestamps, large IDs) collapse into
+  one — along with NaN/±Inf/negative-zero edge cases that integers simply
+  do not have. Fractional buckets follow the same discipline as exact
+  metrics: scale to minor units. Ordered dictionaries were rejected because
+  compaction's renumbering must stay monotonic in the old ids
+  (value-ordering would force a full re-sort per compaction); per-query
+  dictionary scans were rejected as milliseconds of parsing per call.
+  Instead the dictionary carries a parsed `vals []int64` maintained at
+  insertion, making a range check two integer comparisons per row. Time
+  support is by encoding (unix timestamps), not layout parsing. The type
+  lives on the dimension declaration itself (`Dim{Name, Type}` — one struct
+  per dim rather than parallel tag lists, so a future `DimFloat` would be
+  additive). `DimType` stays out of the schema fingerprint; loading
+  validates canonicality instead, so a snapshot written before the
+  declaration is refused into the normal full-pull fallback.
 - **GROUP BY relaxes the allocation rule — explicitly, and only there.**
   Group-by output is inherently variable-size, so "zero allocations" is
   unattainable; the honest contract is O(result groups) allocations per call
