@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 )
 
 const snapMagic = "FCSNAP01"
@@ -82,7 +83,8 @@ func writeSnapshotFile(path string, sc *Schema, snap *snapshot) (err error) {
 	wU64(uint64(snap.rows()))
 	for _, d := range snap.dicts {
 		wU32(uint32(d.len()))
-		for _, s := range d.strs {
+		for id := range d.len() {
+			s := d.str(uint32(id)) // integer dims: rendered on demand
 			wU32(uint32(len(s)))
 			w.WriteString(s)
 		}
@@ -197,19 +199,22 @@ func readSnapshotFile(path string, sc *Schema, ttlCutoff int64) (*snapshot, erro
 			if !ok {
 				return nil, errSnapshotFormat
 			}
+			if sc.isInt(d) {
+				// integer identity: non-integer entries reject the snapshot
+				// (guards snapshots written before the dim was declared
+				// DimInt); different spellings of one integer collapse into
+				// one id and are then rejected by the count check below
+				v64, err := strconv.ParseInt(string(sb), 10, 64)
+				if err != nil {
+					return nil, errSnapshotFormat
+				}
+				snap.dicts[d].getOrAddN(v64)
+				continue
+			}
 			snap.dicts[d].getOrAdd(string(sb))
 		}
 		if snap.dicts[d].len() != int(cnt) {
-			return nil, errSnapshotFormat // duplicate strings in stored dict
-		}
-		if sc.isInt(d) {
-			// integer identity: every stored entry must already be canonical
-			// (guards snapshots written before the dim was declared DimInt)
-			for _, str := range snap.dicts[d].strs {
-				if cs, ok := canonInt(str); !ok || cs != str {
-					return nil, errSnapshotFormat
-				}
-			}
+			return nil, errSnapshotFormat // duplicate entries in stored dict
 		}
 		cards[d] = int(cnt)
 	}

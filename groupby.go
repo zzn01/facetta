@@ -14,9 +14,11 @@ import (
 // their key strings (in by-dim order), so output is deterministic.
 //
 // Reusing one GroupedResult across calls amortizes its internal storage; the
-// remaining per-call allocations are O(result groups) — map key interning and
-// sort scratch — never O(scanned rows). Key strings reference the store's
-// immutable dictionaries (no copies) and stay valid after the call.
+// remaining per-call allocations are O(result groups) — map key interning,
+// sort scratch, and integer-dim key rendering — never O(scanned rows). Key
+// strings of string dims alias the store's immutable dictionaries (no
+// copies); integer-dim keys are rendered per call. All stay valid after the
+// call.
 type GroupedResult struct {
 	N    int       // number of result groups
 	Keys []string  // row-major, N × len(by)

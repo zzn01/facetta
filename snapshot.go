@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/bits"
 	"slices"
+	"strconv"
 	"time"
 )
 
@@ -121,15 +122,15 @@ func buildFromRecords(sc *Schema, recs []Record, ttlCutoff, now int64) (*snapsho
 			continue
 		}
 		for d := range nd {
-			sv := r.Dims[d]
 			if sc.isInt(d) {
-				cs, ok := canonInt(sv)
-				if !ok {
-					return nil, fmt.Errorf("facetta: record %d: non-integer value %q for integer dimension %q", i, sv, sc.Dims[d].Name)
+				n64, err := strconv.ParseInt(r.Dims[d], 10, 64)
+				if err != nil {
+					return nil, fmt.Errorf("facetta: record %d: non-integer value %q for integer dimension %q", i, r.Dims[d], sc.Dims[d].Name)
 				}
-				sv = cs
+				ids = append(ids, dicts[d].getOrAddN(n64))
+				continue
 			}
-			ids = append(ids, dicts[d].getOrAdd(sv))
+			ids = append(ids, dicts[d].getOrAdd(r.Dims[d]))
 		}
 		metsIn = append(metsIn, r.Metrics...)
 		ups = append(ups, u)
@@ -246,8 +247,8 @@ func mergeView(sc *Schema, v *view, ttlCutoff, now int64, renumber bool) (*snaps
 				continue
 			}
 			dicts[i] = v.base.dicts[i].clone()
-			for _, s := range v.extras[i].strs {
-				dicts[i].getOrAdd(s)
+			for id := range v.extras[i].len() {
+				dicts[i].addFrom(v.extras[i], uint32(id))
 			}
 		}
 		return zipMerge(sc, v, ttlCutoff, now, dicts, nil)
@@ -287,13 +288,11 @@ func mergeView(sc *Schema, v *view, ttlCutoff, now int64, renumber bool) (*snaps
 			if !bitGet(used[i], old) {
 				continue
 			}
-			s := ""
 			if old < baseLen {
-				s = base.dicts[i].strs[old]
+				remap[i][old] = dicts[i].addFrom(base.dicts[i], uint32(old))
 			} else {
-				s = v.extras[i].strs[old-baseLen]
+				remap[i][old] = dicts[i].addFrom(v.extras[i], uint32(old-baseLen))
 			}
-			remap[i][old] = dicts[i].getOrAdd(s)
 		}
 	}
 	return zipMerge(sc, v, ttlCutoff, now, dicts, remap)

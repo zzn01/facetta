@@ -132,7 +132,9 @@ Semantics and limits:
   are canonicalized at every write and query boundary, so `"01"` and `"+1"`
   are the same row, the same dictionary entry and the group-by key `"1"`,
   exact over the full int64 range — dimension identity has no float
-  precision cliff (nanosecond timestamps are safe). Non-integer values
+  precision cliff (nanosecond timestamps are safe). Integer dictionaries
+  are keyed by the value itself and store no strings; spellings are
+  rendered only where output needs them (group-by keys, snapshot files). Non-integer values
   (`"1.5"`, `"abc"`) are rejected explicitly — ingestion and conditions
   error rather than silently mismatch. Parsing happens once per dictionary
   entry at insertion, never on the query path: a range check is two integer

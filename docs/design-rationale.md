@@ -211,9 +211,12 @@ constraint, which drove four decisions:
   compaction's renumbering must stay monotonic in the old ids
   (value-ordering would force a full re-sort per compaction); per-query
   dictionary scans were rejected as milliseconds of parsing per call.
-  Instead the dictionary carries a parsed `vals []int64` maintained at
-  insertion, making a range check two integer comparisons per row. Time
-  support is by encoding (unix timestamps), not layout parsing. The type
+  Instead, integer dictionaries are keyed by the int64 value itself and
+  store no strings at all — identity is enforced by the map key, spellings
+  are rendered only at output boundaries (group-by keys, snapshot save) —
+  and their `vals []int64` column makes a range check two integer
+  comparisons per row. Time support is by encoding (unix timestamps), not
+  layout parsing. The type
   lives on the dimension declaration itself (`Dim{Name, Type}` — one struct
   per dim rather than parallel tag lists, so a future `DimFloat` would be
   additive). `DimType` stays out of the schema fingerprint; loading

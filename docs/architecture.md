@@ -50,7 +50,7 @@ Three pillars:
 | File | Lines | Responsibility |
 |------|-----:|------|
 | `schema.go` | 161 | `Schema`/`Record`/`Config` definitions and validation, error sentinels, schema fingerprint |
-| `dict.go` | 53 | String ↔ uint32 id dictionary (+ parsed-value array for integer dims), immutable once published |
+| `dict.go` | 103 | Value ↔ uint32 id dictionary: spelling-keyed for string dims, int64-keyed (no strings stored) for integer dims |
 | `snapshot.go` | 424 | Immutable columnar base; full build (`buildFromRecords`) and merge (`mergeView`/`zipMerge`) |
 | `view.go` | 227 | `view`/`delta` structures; write path `applyDelta` (copy-on-write) |
 | `store.go` | 193 | `Store` facade: atomic pointer, write lock, `Apply`/`Compact`/`ReplaceAll` |
@@ -182,16 +182,21 @@ zero-allocation rule.
 
 Range conditions (`Cond.Range`, integer dims only) piggyback on the same
 machinery. On dims declared `DimInt` (`Dim.Type`), identity is the int64
-value: every write boundary (build, merge, Apply) canonicalizes spellings to
-plain base-10 form before dictionary insertion (rejecting non-integer
-input), and the query boundary canonicalizes condition values into a stack
-buffer looked up allocation-free. The dictionaries carry a parallel
-`vals []int64`, so a range check at query time is an id lookup plus two
+value, and their dictionaries enforce it structurally: they are keyed by the
+int64 itself (`map[int64]id` plus a `vals []int64` column) and store no
+strings at all. Write and query boundaries just ParseInt and look the value
+up (rejecting non-integer input with an error); no spelling is ever rendered
+on those paths, so different spellings of one integer cannot even exist as
+separate entries. A range check at query time is an id lookup plus two
 integer comparisons — no dictionary scan, no bitset, no allocation, and no
-float precision cliff anywhere in dimension identity. The snapshot format
-is untouched (vals re-derived on load), and loading validates that an
-integer dim's stored entries are canonical, refusing snapshots written
-before the dim was declared DimInt.
+float precision cliff anywhere in dimension identity. Spellings are
+formatted on demand only at output boundaries: group-by keys (per-call
+rendering, inside the documented O(result groups) allocation budget) and
+snapshot save. The snapshot format is untouched; loading parses entries
+back (non-integer entries reject the snapshot, and spellings of one integer
+collapsing into one id trip the entry-count check), so snapshots written
+before the dim was declared DimInt are refused into the full-pull
+fallback.
 
 IN conditions (`Cond.In`) are resolved into a per-query id pool (`queryIns`)
 rather than into `groupPlan`, and checked by `matchIns` at the call sites

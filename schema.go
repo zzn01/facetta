@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
-	"strconv"
 	"time"
 )
 
@@ -120,20 +119,6 @@ func (s *Schema) fingerprint() uint64 {
 		h.Write([]byte{0})
 	}
 	return h.Sum64()
-}
-
-// canonInt returns the canonical spelling of an integer dim value: plain
-// base-10 int64 formatting ("01"/"+1"/"-0" -> "1"/"1"/"0"). This IS the
-// identity form for integer dims — every write and query boundary rewrites
-// values through it, so equality, IN, Range, dedup and group-by keys all
-// agree on the integer, not the spelling, exactly over the full int64
-// range. Non-integer values are rejected (ok == false).
-func canonInt(s string) (string, bool) {
-	v, err := strconv.ParseInt(s, 10, 64)
-	if err != nil {
-		return "", false
-	}
-	return strconv.FormatInt(v, 10), true
 }
 
 // isInt reports whether dim i was declared DimInt.

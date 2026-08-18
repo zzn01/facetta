@@ -6,24 +6,37 @@ import (
 	"strconv"
 )
 
-// dict maps dimension strings to dense uint32 ids. Immutable once published
-// in a view; writers clone before extending. Dictionaries of dims declared
-// DimInt hold canonical integer spellings only (enforced at the write/load
-// boundaries) and carry vals, a parallel array of each entry's parsed int64,
-// so range conditions cost two integer comparisons per row at query time:
-// parsing happens once per dictionary entry, on insertion, never on the
-// query path.
+// dict maps dimension values to dense uint32 ids. Immutable once published
+// in a view; writers clone before extending. Two variants share the struct:
+//
+//   - String dims key by spelling and keep the strings (they are the
+//     interchange format: persistence, group-by keys alias them).
+//   - Integer dims (DimInt) key by the int64 VALUE and store no strings at
+//     all — identity is the integer, enforced by the map key itself, so the
+//     write and query paths never render a spelling. Spellings exist only at
+//     output boundaries (group-by keys, snapshot save), formatted on demand
+//     by str().
+//
+// A range check at query time reads vals directly: two integer comparisons
+// per row, parsing confined to the boundaries.
 type dict struct {
-	ids     map[string]uint32
-	strs    []string
 	numeric bool
-	vals    []int64 // [id] parsed value; only when numeric
+	// string dims
+	ids  map[string]uint32
+	strs []string
+	// integer dims
+	idsN map[int64]uint32
+	vals []int64 // [id] value; doubles as the range-check column
 }
 
 func newDict(numeric bool) *dict {
-	return &dict{ids: map[string]uint32{}, numeric: numeric}
+	if numeric {
+		return &dict{numeric: true, idsN: map[int64]uint32{}}
+	}
+	return &dict{ids: map[string]uint32{}}
 }
 
+// getOrAdd interns a string-dim value. String dicts only.
 func (d *dict) getOrAdd(s string) uint32 {
 	if id, ok := d.ids[s]; ok {
 		return id
@@ -31,12 +44,28 @@ func (d *dict) getOrAdd(s string) uint32 {
 	id := uint32(len(d.strs))
 	d.ids[s] = id
 	d.strs = append(d.strs, s)
-	if d.numeric {
-		// canonical entries always parse; err is unreachable by construction
-		v, _ := strconv.ParseInt(s, 10, 64)
-		d.vals = append(d.vals, v)
-	}
 	return id
+}
+
+// getOrAddN interns an integer-dim value. Integer dicts only.
+func (d *dict) getOrAddN(v int64) uint32 {
+	if id, ok := d.idsN[v]; ok {
+		return id
+	}
+	id := uint32(len(d.vals))
+	d.idsN[v] = id
+	d.vals = append(d.vals, v)
+	return id
+}
+
+// addFrom copies src's entry id into d (both dicts of the same variant),
+// returning its id in d. Lets merge and dictionary compaction stay
+// variant-agnostic.
+func (d *dict) addFrom(src *dict, id uint32) uint32 {
+	if d.numeric {
+		return d.getOrAddN(src.vals[id])
+	}
+	return d.getOrAdd(src.strs[id])
 }
 
 func (d *dict) lookup(s string) (uint32, bool) {
@@ -44,15 +73,31 @@ func (d *dict) lookup(s string) (uint32, bool) {
 	return id, ok
 }
 
-// lookupB looks up a key rendered into a byte buffer without allocating
-// (the string conversion inside a map index is free).
-func (d *dict) lookupB(b []byte) (uint32, bool) {
-	id, ok := d.ids[string(b)]
+func (d *dict) lookupN(v int64) (uint32, bool) {
+	id, ok := d.idsN[v]
 	return id, ok
 }
 
-func (d *dict) len() int { return len(d.strs) }
+// str renders entry id's spelling: aliased for string dims, formatted on
+// demand for integer dims (allocates — output boundaries only).
+func (d *dict) str(id uint32) string {
+	if d.numeric {
+		return strconv.FormatInt(d.vals[id], 10)
+	}
+	return d.strs[id]
+}
+
+func (d *dict) len() int {
+	if d.numeric {
+		return len(d.vals)
+	}
+	return len(d.strs)
+}
 
 func (d *dict) clone() *dict {
-	return &dict{ids: maps.Clone(d.ids), strs: slices.Clone(d.strs), numeric: d.numeric, vals: slices.Clone(d.vals)}
+	return &dict{
+		numeric: d.numeric,
+		ids:     maps.Clone(d.ids), strs: slices.Clone(d.strs),
+		idsN: maps.Clone(d.idsN), vals: slices.Clone(d.vals),
+	}
 }

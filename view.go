@@ -58,34 +58,34 @@ func (v *view) lookupID(dim int, s string) (uint32, bool) {
 	return 0, false
 }
 
-// lookupNumID resolves an integer dim's condition value: parse it, render
-// the canonical spelling into a stack buffer, and look that up
-// allocation-free (map indexing with string(bytes) does not allocate).
-// valid is false when the value does not parse as an int64 — a caller error
-// on an integer dim, reported rather than silently matching nothing.
+// lookupNumID resolves an integer dim's condition value: parse and look the
+// int64 up directly in the value-keyed dictionaries — no spelling is ever
+// rendered, so the lookup is trivially allocation-free. valid is false when
+// the value does not parse as an int64 — a caller error on an integer dim,
+// reported rather than silently matching nothing.
 func (v *view) lookupNumID(dim int, s string) (id uint32, found, valid bool) {
 	f, err := strconv.ParseInt(s, 10, 64)
 	if err != nil {
 		return 0, false, false
 	}
-	var buf [24]byte
-	b := strconv.AppendInt(buf[:0], f, 10)
-	if id, ok := v.base.dicts[dim].lookupB(b); ok {
+	if id, ok := v.base.dicts[dim].lookupN(f); ok {
 		return id, true, true
 	}
-	if id, ok := v.extras[dim].lookupB(b); ok {
+	if id, ok := v.extras[dim].lookupN(f); ok {
 		return uint32(v.base.dicts[dim].len()) + id, true, true
 	}
 	return 0, false, true
 }
 
-// dimString resolves a combined-space dim id back to its string: below the
-// base dictionary length it is a base id, above it an extras id.
+// dimString resolves a combined-space dim id back to its spelling: below
+// the base dictionary length it is a base id, above it an extras id. For
+// integer dims the spelling is rendered on demand (allocates — group-by
+// keys are the only caller).
 func (v *view) dimString(dim int, id uint32) string {
 	if n := uint32(v.base.dicts[dim].len()); id >= n {
-		return v.extras[dim].strs[id-n]
+		return v.extras[dim].str(id - n)
 	}
-	return v.base.dicts[dim].strs[id]
+	return v.base.dicts[dim].str(id)
 }
 
 func (v *view) maxUpdated() int64 {
@@ -185,14 +185,29 @@ func (v *view) applyDelta(sc *Schema, recs []Record, ttlCutoff int64, capBlocked
 		e := expireMilli(rec.ExpireAt)
 		allInBase := true
 		for d := range nd {
-			sv := rec.Dims[d]
 			if sc.isInt(d) {
-				cs, ok := canonInt(sv)
-				if !ok {
-					return nil, dropped, fmt.Errorf("facetta: record %d: non-integer value %q for integer dimension %q", i, sv, sc.Dims[d].Name)
+				n64, err := strconv.ParseInt(rec.Dims[d], 10, 64)
+				if err != nil {
+					return nil, dropped, fmt.Errorf("facetta: record %d: non-integer value %q for integer dimension %q", i, rec.Dims[d], sc.Dims[d].Name)
 				}
-				sv = cs
+				if id, ok := v.base.dicts[d].lookupN(n64); ok {
+					ids[d] = id
+					continue
+				}
+				allInBase = false
+				baseLen := uint32(v.base.dicts[d].len())
+				if id, ok := nv.extras[d].lookupN(n64); ok {
+					ids[d] = baseLen + id
+					continue
+				}
+				if !extrasOwned[d] {
+					nv.extras[d] = nv.extras[d].clone()
+					extrasOwned[d] = true
+				}
+				ids[d] = baseLen + nv.extras[d].getOrAddN(n64)
+				continue
 			}
+			sv := rec.Dims[d]
 			if id, ok := v.base.dicts[d].lookup(sv); ok {
 				ids[d] = id
 				continue
