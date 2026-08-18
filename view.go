@@ -69,6 +69,9 @@ func (v *view) lookupNumID(dim int, s string) (id uint32, found, valid bool) {
 	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
 		return 0, false, false
 	}
+	if f == 0 {
+		f = 0 // collapse -0 into +0, mirroring canonNum
+	}
 	var buf [32]byte
 	b := strconv.AppendFloat(buf[:0], f, 'g', -1, 64)
 	if id, ok := v.base.dicts[dim].lookupB(b); ok {

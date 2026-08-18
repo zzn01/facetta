@@ -133,6 +133,9 @@ func canonNum(s string) (string, bool) {
 	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
 		return "", false
 	}
+	if v == 0 {
+		v = 0 // collapse -0 into +0: they compare equal, so one identity
+	}
 	return strconv.FormatFloat(v, 'g', -1, 64), true
 }
 

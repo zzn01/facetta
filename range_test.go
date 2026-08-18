@@ -279,6 +279,31 @@ func TestNumericDimCanonicalIdentity(t *testing.T) {
 	}
 }
 
+func TestNumericDimNegativeZero(t *testing.T) {
+	// -0 and 0 compare equal as numbers, so they must be ONE identity: the
+	// canonical-string/float64 bijection would otherwise leak exactly the
+	// spelling/value split this design exists to prevent.
+	s := numericStore(t, numericRecords())
+	if err := s.Apply([]Record{rec(ts(200), []float64{7, 1}, "s1", "a1", "p1", "-0", "ios")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Apply([]Record{rec(ts(300), []float64{9, 2}, "s1", "a1", "p1", "0.0", "ios")}); err != nil {
+		t.Fatal(err)
+	}
+	for _, spell := range []string{"0", "-0", "0.0", "-0.0"} {
+		got, err := s.Query(nil, []Cond{{Dim: "country", Value: spell}})
+		if err != nil {
+			t.Fatalf("%q: %v", spell, err)
+		}
+		assertSame(t, got, []float64{9, 2}) // one row, latest upsert wins
+	}
+	got, err := s.Query(nil, []Cond{{Dim: "country", Range: &Range{Min: 0, Max: 0}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSame(t, got, []float64{9, 2})
+}
+
 func TestNumericDimRejectsBadValues(t *testing.T) {
 	bad := []Record{rec(ts(100), []float64{1, 1}, "s1", "a1", "p1", "oops", "ios")}
 	s, err := New(numericSchema(), Config{})
