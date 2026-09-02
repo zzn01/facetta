@@ -11,16 +11,38 @@ import (
 const (
 	fastGroups = 16 // OR groups
 	fastConds  = 32 // total equality conditions across all groups
-	// fastIvs == fastGroups: planGroups emits at most one interval per plan
-	// and len(qs.plans) <= fastGroups in this task's scope (no per-group
-	// interval expansion yet). Task 5's IN-index expansion will need to
-	// revisit this — the pooled side already sizes ivs by shape
-	// (getPooledScratch), so only this stack-fast bound is at risk.
+	// fastIvs == fastGroups covers the one-interval-per-plan floor: every
+	// plan is guaranteed a slot (planGroups reserves one per unplanned
+	// group). IN index expansion emits more than one interval per plan, and
+	// on this path it may only use whatever slots that reservation leaves
+	// over — so a 16-group stack query expands barely at all, while a 2-group
+	// one has 14 spare slots. With several groups each carrying an index-dim
+	// IN, an early group's expansion can eat the room a later one needed,
+	// degrading that later group to a full scan and wasting the earlier
+	// expansion entirely — measured on a 2-group x 10-value-IN shape
+	// (BenchmarkQueryMultiGroupInExpansion1M) at ~2.9x slower than routing
+	// the same query to the pool. queryShape.fits (below) closes exactly
+	// that starvation case by routing it to the pooled scratch instead,
+	// whose expansionIvs headroom (below) is generous enough that every
+	// group expands fully; the extra pool round trip this costs a shape
+	// that never needed it (e.g. a single group with a 16-value IN,
+	// BenchmarkQueryIndexInExpansion1M) is unmeasurable next to that query's
+	// own cost. Growing fastIvs itself to avoid the reroute was rejected: it
+	// would grow every query's stack frame for a case the pool already
+	// serves at no measurable cost.
 	fastIvs     = fastGroups
 	fastInConds = 16  // total IN conditions
 	fastInIDs   = 128 // total IN input values
 	fastRanges  = 16  // total range conditions
 	fastAggs    = 16  // aggregate output columns
+
+	// expansionIvs is the interval headroom every POOLED scratch carries on
+	// top of its one-per-group floor, for IN index expansion to spend (see
+	// plan()). 4096 intervals is 64KB of iv — comfortably under the 1MB
+	// retention guard below, so a pooled scratch still gets reused — and it
+	// caps the planner's own cost too: expansion never probes more than this
+	// many key ranges per plan, whatever the IN sets look like.
+	expansionIvs = 4096
 
 	// A pooled scratch whose retained capacity exceeds this is dropped on
 	// release instead of returned to the pool, so one pathological query
@@ -72,6 +94,22 @@ func measureShape(groups [][]Cond, nAggs int) queryShape {
 }
 
 func (sh queryShape) fits() bool {
+	// Multi-group IN-expansion starvation guard (see the comment on fastIvs):
+	// a shape carrying at least one IN condition, whose group count plus
+	// total IN input values already exceeds the stack's whole interval
+	// budget, is over-approximated straight to the pool rather than risking
+	// an early group's expansion starving a later one on the stack. This is
+	// deliberately pessimistic — sh.inVals doesn't know how many of those
+	// values land on an index dim, or whether several IN conds in one group
+	// would multiply into a cartesian product instead of adding — so it
+	// reroutes some shapes that would have fit fine (measured cost:
+	// unmeasurable, since the pool round trip is nanoseconds against any
+	// query too big to fit fastIvs's 16 slots). Getting this exactly right
+	// would need to replicate planExpand's own combination accounting here,
+	// which is not worth it for a routing decision.
+	if sh.inConds > 0 && sh.groups+sh.inVals > fastIvs {
+		return false
+	}
 	return sh.groups <= fastGroups && sh.conds <= fastConds &&
 		sh.inConds <= fastInConds && sh.inVals <= fastInIDs &&
 		sh.ranges <= fastRanges && sh.aggs <= fastAggs
@@ -222,10 +260,15 @@ var scratchPool = sync.Pool{New: func() any { return &queryScratch{pooled: true}
 func getPooledScratch(sh queryShape) *queryScratch {
 	q := scratchPool.Get().(*queryScratch)
 	q.plans = grow(q.plans, sh.groups)
-	// One base candidate interval per group, at most (no per-group interval
-	// expansion until Task 5's IN-index expansion lands, at which point this
-	// sizing needs revisiting alongside the offset+count scheme above).
-	q.ivs = grow(q.ivs, sh.groups)
+	// One base candidate interval per group as a floor, plus the expansion
+	// headroom (see expansionIvs) — but only for shapes that carry an IN
+	// condition at all, since nothing else can ever expand and the headroom
+	// is 64KB a pool miss would otherwise have to re-allocate.
+	ivs := sh.groups
+	if sh.inConds > 0 {
+		ivs += expansionIvs
+	}
+	q.ivs = grow(q.ivs, ivs)
 	q.condDims = grow(q.condDims, sh.conds)
 	q.condIDs = grow(q.condIDs, sh.conds)
 	q.inWins = grow(q.inWins, sh.inConds)

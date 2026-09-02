@@ -53,7 +53,18 @@ func TestEquivalenceRandomized(t *testing.T) {
 				for g := range groups {
 					nc := rng.Intn(4)
 					for range nc {
+						// Pick the condition kind BEFORE the dim so IN
+						// conditions can be biased onto the index prefix
+						// (dims 0..IndexDims-1), where the planner expands
+						// them into one key interval per candidate — and,
+						// with two such conds in one group, into a
+						// cartesian of intervals. Everything else is
+						// uniform over all dims as before.
+						kind := rng.Intn(4) // 0: IN, 1: maybe range, else equality
 						d := rng.Intn(len(sc.Dims))
+						if kind == 0 && rng.Intn(2) == 0 {
+							d = rng.Intn(sc.IndexDims)
+						}
 						val := func() string {
 							if sc.Dims[d].Name == "country" {
 								// numeric dim: random spelling of the same number
@@ -70,7 +81,7 @@ func TestEquivalenceRandomized(t *testing.T) {
 							return fmt.Sprintf("%s%d", sc.Dims[d].Name[:1], rng.Intn(card+1)) // sometimes absent
 						}
 						switch {
-						case rng.Intn(4) == 0:
+						case kind == 0:
 							// ~1 in 4 conditions is an IN set of 1-3 values,
 							// or 1-40 for a big shape.
 							inN := 1 + rng.Intn(3)
@@ -82,7 +93,7 @@ func TestEquivalenceRandomized(t *testing.T) {
 								in[i] = val()
 							}
 							groups[g] = append(groups[g], Cond{Dim: sc.Dims[d].Name, In: in})
-						case rng.Intn(4) == 0 && sc.Dims[d].Name == "country":
+						case kind == 1 && sc.Dims[d].Name == "country":
 							// numeric dim: sometimes a range (possibly inverted -> empty)
 							lo := int64(rng.Intn(card + 2))
 							hi := int64(rng.Intn(card + 2))

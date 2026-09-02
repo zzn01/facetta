@@ -59,6 +59,30 @@ func BenchmarkQueryIndexed1M(b *testing.B) {
 	}
 }
 
+// BenchmarkQuerySmallIn1M runs an indexed equality prefix ("source", the same
+// ~20k-row candidate range as BenchmarkGroupByIndexed1M/BenchmarkQueryAggsDistinct1M)
+// plus a 3-value IN condition on "os" (a non-index dim, 8 distinct values in
+// the dataset): this is matchOneIn's linear-scan shape (n=3, far under the
+// 16-value binary-search threshold), the common case in practice, as opposed
+// to BenchmarkQueryLargeIn1M's 1024-value binary-search path. Baseline
+// documentation only, no gate.
+func BenchmarkQuerySmallIn1M(b *testing.B) {
+	s := benchStore(b, 1_000_000)
+	buf := make([]float64, 0, 2)
+	groups := [][]Cond{
+		{{Dim: "source", Value: "src7"}, {Dim: "os", In: []string{"os0", "os1", "os2"}}},
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var err error
+		buf, err = s.QueryGroups(buf, groups)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkQueryLargeIn1M runs an indexed equality prefix ("source", the same
 // ~20k-row candidate range as BenchmarkGroupByIndexed1M/BenchmarkQueryAggsDistinct1M)
 // plus a 1024-value IN condition on "country" (a non-index dim, ~200 distinct
@@ -80,6 +104,67 @@ func BenchmarkQueryLargeIn1M(b *testing.B) {
 	}
 	groups := [][]Cond{
 		{{Dim: "source", Value: "src7"}, {Dim: "country", In: in}},
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var err error
+		buf, err = s.QueryGroups(buf, groups)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkQueryIndexInExpansion1M measures IN index expansion: a 16-value IN
+// on "source" (the FIRST index dim; the dataset has 50 distinct sources) used
+// to have no usable index prefix and degraded to a full 1M-row scan. The
+// planner now expands it into 16 key intervals, so the sweep visits only the
+// ~16/50 of the table those sources cover. The win is therefore bounded by
+// the IN's selectivity, not by the interval machinery — same query, same
+// answer, a third of the rows touched.
+func BenchmarkQueryIndexInExpansion1M(b *testing.B) {
+	s := benchStore(b, 1_000_000)
+	buf := make([]float64, 0, 2)
+	in := make([]string, 16)
+	for i := range in {
+		in[i] = fmt.Sprintf("src%d", i) // 16 of the dataset's 50 sources
+	}
+	groups := [][]Cond{{{Dim: "source", In: in}}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var err error
+		buf, err = s.QueryGroups(buf, groups)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkQueryMultiGroupInExpansion1M measures the stack-path starvation
+// case for IN index expansion (see the routing decision on queryShape.fits,
+// scratch.go, and the task report): two groups each carry a 10-value IN on
+// "source", the first index dim. Planned in order, the first group's
+// expansion spends 10 of the stack scratch's 16 interval slots; the second
+// group's reservation (room = cap(ivs) - len(ivs) - reserve) then has too
+// little room for its own 10-combination expansion and falls back to a full
+// scan (see planExpand's cost-crossover check). The union sweep's [0,N)
+// full-scan interval then dominates regardless of the first group's much
+// narrower range, so the whole query ends up costing close to a full table
+// scan even though both groups' IN sets were individually cheap to expand.
+func BenchmarkQueryMultiGroupInExpansion1M(b *testing.B) {
+	s := benchStore(b, 1_000_000)
+	buf := make([]float64, 0, 2)
+	in1 := make([]string, 10)
+	in2 := make([]string, 10)
+	for i := range in1 {
+		in1[i] = fmt.Sprintf("src%d", i)    // sources 0..9
+		in2[i] = fmt.Sprintf("src%d", i+10) // sources 10..19, disjoint from in1
+	}
+	groups := [][]Cond{
+		{{Dim: "source", In: in1}},
+		{{Dim: "source", In: in2}},
 	}
 	b.ReportAllocs()
 	b.ResetTimer()

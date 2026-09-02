@@ -1,8 +1,10 @@
 package facetta
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
+	"math/bits"
 	"slices"
 	"sort"
 )
@@ -12,13 +14,15 @@ import (
 type Cond struct {
 	Dim, Value string
 	// In, when non-empty, matches rows whose Dim equals ANY listed value;
-	// Value must be empty then. IN conditions filter rows but do not
-	// contribute to index-prefix planning: a group whose leading index dims
-	// carry only IN conditions degrades to a full scan (guarded by
-	// Config.MaxScanRows). For indexed multi-value queries use one group per
-	// value instead. In has no count limit; values absent from the table are
-	// simply dropped from the set. Queries are guarded only by
-	// Config.MaxScanRows.
+	// Value must be empty then. An IN on a leading index dim joins
+	// index-prefix planning: the planner expands it into one key interval
+	// per candidate value (and per combination when several index dims carry
+	// INs), so multi-value filters stay indexed instead of degrading to a
+	// full scan. Expansion is budgeted — a set so large that probing every
+	// combination would cost more than scanning the table falls back to the
+	// scan (guarded by Config.MaxScanRows) — and INs on non-index dims stay
+	// pure row filters. In has no count limit; values absent from the table
+	// are simply dropped from the set.
 	In []string
 	// Range, when non-nil, matches rows whose Dim value (an int64 — see
 	// DimInt: identity on such dims IS the integer) falls within
@@ -57,13 +61,27 @@ type groupPlan struct {
 }
 
 // plan resolves one group against v: dict-encodes conditions, finds the
-// longest fully-specified index-dim prefix and binary-searches its key range.
+// longest index-dim prefix it can cover (equality conds pin a dim, IN conds
+// expand into candidate ids) and emits the resulting base candidate key
+// intervals straight into qs.ivs — a plan contributes one interval per
+// expanded combination, so planGroups no longer collects them.
+//
+// reserve is the number of groups still to be planned after this one. Every
+// plan can emit at least one interval, so expansion here may only consume
+// the qs.ivs slots beyond that reservation; qs.ivs is pre-sized by the
+// caller's routing and must never grow (see the CAUTION on queryScratch).
+//
 // All variable-length outputs live in qs pools; p holds offset+count views
 // (see the comment on groupPlan for why not sub-slices).
-func (v *view) plan(sc *Schema, g []Cond, p *groupPlan, qs *queryScratch) error {
+func (v *view) plan(sc *Schema, g []Cond, p *groupPlan, qs *queryScratch, reserve int) error {
 	*p = groupPlan{basePossible: true}
 	if len(g) == 0 {
-		p.scan = true // empty group matches every row
+		// empty group matches every row
+		p.scan = true
+		if n := v.base.rows(); n > 0 {
+			qs.ivs = qs.ivs[:len(qs.ivs)+1] // reserve guarantees one free slot
+			qs.ivs[len(qs.ivs)-1] = iv{0, n}
+		}
 		return nil
 	}
 	condOff := len(qs.condDims)
@@ -165,6 +183,15 @@ func (v *view) plan(sc *Schema, g []Cond, p *groupPlan, qs *queryScratch) error 
 	if !p.basePossible {
 		return nil // lo == hi == 0: skip base, delta scan still applies
 	}
+	if p.insN > 0 {
+		// An IN cond may cover an index-prefix dim, which turns planning
+		// into a candidate expansion. That lives in its own frame
+		// (planExpand) so this function — the path every equality-only
+		// query takes — pays neither its scratch arrays nor its odometer;
+		// keeping the two apart is worth ~4% on multi-group queries
+		// (measured, see the task report).
+		return v.planExpand(sc, p, qs, reserve)
+	}
 	var pref [maxDims]uint32
 	var has [maxDims]bool
 	for i := int32(0); i < p.condN; i++ {
@@ -179,6 +206,10 @@ func (v *view) plan(sc *Schema, g []Cond, p *groupPlan, qs *queryScratch) error 
 	}
 	if k == 0 {
 		p.scan = true // no usable prefix: degraded full scan
+		if n := base.rows(); n > 0 {
+			qs.ivs = qs.ivs[:len(qs.ivs)+1] // reserve guarantees one free slot
+			qs.ivs[len(qs.ivs)-1] = iv{0, n}
+		}
 		return nil
 	}
 	var lo64 uint64
@@ -188,6 +219,159 @@ func (v *view) plan(sc *Schema, g []Cond, p *groupPlan, qs *queryScratch) error 
 	hi64 := lo64 | ((uint64(1) << base.shifts[k-1]) - 1)
 	p.lo = sort.Search(len(base.keys), func(i int) bool { return base.keys[i] >= lo64 })
 	p.hi = sort.Search(len(base.keys), func(i int) bool { return base.keys[i] > hi64 })
+	if p.lo < p.hi {
+		qs.ivs = qs.ivs[:len(qs.ivs)+1] // reserve guarantees one free slot
+		qs.ivs[len(qs.ivs)-1] = iv{p.lo, p.hi}
+	}
+	return nil
+}
+
+// planExpand is plan()'s tail for a group carrying at least one IN condition:
+// index-prefix dims may be covered by candidate id SETS, so the plan can emit
+// one key interval per candidate combination instead of a single one. Split
+// out of plan() to keep its scratch arrays and odometer off the equality-only
+// hot path (see the call site). Preconditions are plan()'s: the group's conds
+// are resolved into qs, p's offset+count views are set, p is neither dead nor
+// base-impossible, and reserve interval slots are owed to later groups.
+//
+//go:noinline
+func (v *view) planExpand(sc *Schema, p *groupPlan, qs *queryScratch, reserve int) error {
+	base := v.base
+	// Index-prefix coverage: a dim joins the prefix when an equality cond
+	// pins it, or when an IN cond supplies a candidate id set to expand over.
+	// Range conds never join. A dim carrying BOTH an equality and an IN is
+	// covered by the equality alone and the IN stays a pure row filter: the
+	// equality is never the wider of the two, and matchIns still applies the
+	// set to every visited row, so the AND is exact either way.
+	var eqID [maxDims]uint32
+	var hasEq [maxDims]bool
+	for i := int32(0); i < p.condN; i++ {
+		d := qs.condDims[p.condOff+i]
+		if int(d) < sc.IndexDims {
+			hasEq[d], eqID[d] = true, qs.condIDs[p.condOff+i]
+		}
+	}
+	// Per index dim, that dim's IN window narrowed to its BASE-RESIDENT
+	// candidate ids, as an offset+count into qs.inPool (offsets rather than
+	// []uint32 locals: see the CAUTION on queryScratch). Segments are sorted
+	// ascending, so the base-resident ones are exactly the prefix below the
+	// base dictionary length — delta-only candidates cannot name a base row
+	// and would only produce empty intervals.
+	var candOff, candN [maxDims]int32
+	for i := int32(0); i < p.insN; i++ {
+		w := qs.inWins[p.insOff+i]
+		// A second IN on an already-covered dim is skipped: the first
+		// window's candidates are a superset of the two sets' AND (so the
+		// intervals stay complete), and matchIns applies both windows to
+		// every visited row anyway.
+		if int(w.dim) >= sc.IndexDims || hasEq[w.dim] || candN[w.dim] != 0 {
+			continue
+		}
+		n, _ := slices.BinarySearch(qs.inPool[w.off:w.off+w.n], uint32(base.dicts[w.dim].len()))
+		// n > 0 always: a window with no base-resident candidate at all
+		// cleared p.basePossible in plan(), which returned before calling us.
+		candOff[w.dim], candN[w.dim] = w.off, int32(n)
+	}
+	// Greedy cost crossover, parameter-free: each emitted combination costs
+	// two binary searches over the key column (~ceil(log2 N) probes each), so
+	// extending the prefix by an IN dim pays only while the resulting
+	// combination count P times log2 N stays under a full scan's N rows. The
+	// second cap is the free room in the shared interval sink minus reserve
+	// (see plan's doc comment): qs.ivs must never grow, so expansion stops
+	// instead of overflowing it. room is >= 1 by that reservation, so the
+	// single-interval paths below always fit.
+	nRows := base.rows()
+	logN := bits.Len(uint(nRows))
+	room := cap(qs.ivs) - len(qs.ivs) - reserve
+	combos, k := 1, 0
+	for k < sc.IndexDims {
+		if hasEq[k] {
+			k++
+			continue
+		}
+		c := int(candN[k])
+		if c == 0 {
+			break // dim uncovered: the prefix ends here
+		}
+		n := combos * c
+		if n*logN > nRows || n > room {
+			break // expansion stops paying for itself, or would not fit
+		}
+		combos, k = n, k+1
+	}
+	if k == 0 {
+		p.scan = true // no affordable prefix: degraded full scan
+		if nRows > 0 {
+			qs.ivs = qs.ivs[:len(qs.ivs)+1] // room >= 1
+			qs.ivs[len(qs.ivs)-1] = iv{0, nRows}
+		}
+		return nil
+	}
+	// Odometer over the k-dim prefix: the least-significant covered dim
+	// advances fastest and carries left, standard mixed-radix counting. Each
+	// dim's candidate ids are sorted ascending (see plan()), but IN windows
+	// are not deduplicated, so a repeated id in a more-significant dim can
+	// make the packed-key sequence dip back down right after a carry (the
+	// duplicate re-emits an already-seen combination's key, not a new higher
+	// one). The emitted intervals are therefore NOT guaranteed ascending or
+	// pairwise disjoint in general — only free of duplicates entirely does
+	// that hold. That's harmless downstream: planGroups sorts every interval
+	// by lo before the sweep, and the sweep's high-water mark dedups overlap,
+	// so a re-emitted interval is simply skipped the second time.
+	//
+	// p.lo/p.hi are therefore tracked as an explicit min/max hull over every
+	// emitted interval (0,0 when none), not inferred from emission order.
+	// matchBase's `r < p.lo || r >= p.hi` prefilter stays exact under it: a
+	// base row whose prefix ids match some candidate combination carries that
+	// combination's packed key, hence by key sort order lies INSIDE that
+	// combination's interval, hence inside [p.lo, p.hi). A row sitting in a
+	// hull gap therefore differs from every combination on at least one
+	// covered dim — on an equality-covered dim matchBase's own loop rejects
+	// it, on an IN-covered one matchIns does, since base rows only ever carry
+	// base-resident ids and the cutoff above hides none of those from them.
+	var idx [maxDims]int32
+	for {
+		var lo64 uint64
+		for d := 0; d < k; d++ {
+			id := eqID[d]
+			if !hasEq[d] {
+				id = qs.inPool[candOff[d]+idx[d]]
+			}
+			lo64 |= uint64(id) << base.shifts[d]
+		}
+		hi64 := lo64 | ((uint64(1) << base.shifts[k-1]) - 1)
+		lo := sort.Search(len(base.keys), func(i int) bool { return base.keys[i] >= lo64 })
+		hi := sort.Search(len(base.keys), func(i int) bool { return base.keys[i] > hi64 })
+		if lo < hi {
+			qs.ivs = qs.ivs[:len(qs.ivs)+1] // at most combos <= room writes
+			qs.ivs[len(qs.ivs)-1] = iv{lo, hi}
+			// Explicit hull min/max — see the comment above the loop for why
+			// emission order can't be trusted to be ascending under
+			// duplicate IN ids. p.hi == 0 doubles as "no interval yet",
+			// safe because plan() zeroed *p and every emitted hi is >= 1
+			// (lo < hi and lo >= 0).
+			if p.hi == 0 || lo < p.lo {
+				p.lo = lo
+			}
+			if hi > p.hi {
+				p.hi = hi
+			}
+		}
+		d := k - 1
+		for ; d >= 0; d-- {
+			if hasEq[d] {
+				continue // pinned dim: nothing to advance
+			}
+			idx[d]++
+			if idx[d] < candN[d] {
+				break
+			}
+			idx[d] = 0 // carry into the next dim to the left
+		}
+		if d < 0 {
+			break // odometer wrapped: every combination emitted
+		}
+	}
 	return nil
 }
 
@@ -331,11 +515,19 @@ func (p *groupPlan) matchDelta(qs *queryScratch, d *delta, r int) bool {
 // iv is one base candidate row interval [lo, hi).
 type iv struct{ lo, hi int }
 
-// planGroups plans every group against v, collects the deduped base candidate
-// intervals sorted by lo, and enforces the scan budget. Plans land in
-// qs.plans and intervals in qs.ivs (both pools sized/reset by the caller's
-// routing before this is called — see the comment on scratchBack), so every
-// query entry point (QueryGroups, QueryAggs, QueryGroupBy) shares one planner.
+// ivInsertionSortMax is the interval count up to which planGroups sorts by
+// insertion rather than slices.SortFunc: measured cheaper up here (Task 2),
+// where SortFunc's generic pdqsort machinery and closure call overhead
+// dominate. Above it the O(n^2) tail is the bigger risk, because IN index
+// expansion makes the interval count unbounded by the group count.
+const ivInsertionSortMax = 32
+
+// planGroups plans every group against v and enforces the scan budget. Plans
+// land in qs.plans and their base candidate intervals in qs.ivs, emitted by
+// plan() itself (both pools sized/reset by the caller's routing before this is
+// called — see the comment on scratchBack), so every query entry point
+// (QueryGroups, QueryAggs, QueryGroupBy) shares one planner. Returns the
+// interval count, sorted by lo for the union sweep.
 func (s *Store) planGroups(v *view, groups [][]Cond, qs *queryScratch) (int, error) {
 	if len(groups) == 0 {
 		return 0, errBadGroupCount
@@ -343,37 +535,27 @@ func (s *Store) planGroups(v *view, groups [][]Cond, qs *queryScratch) (int, err
 	sc := &s.sc
 	qs.plans = qs.plans[:len(groups)]
 	for gi := range groups {
-		if err := v.plan(sc, groups[gi], &qs.plans[gi], qs); err != nil {
+		// Reserve one interval slot per group still unplanned, so IN
+		// expansion here can never eat the room a later plan needs.
+		if err := v.plan(sc, groups[gi], &qs.plans[gi], qs, len(groups)-gi-1); err != nil {
 			return 0, err
 		}
 		if qs.plans[gi].scan {
 			s.st.fullScans.Add(1)
 		}
 	}
-	// collect base candidate intervals for the union sweep
-	for gi := range qs.plans {
-		p := &qs.plans[gi]
-		if p.dead || !p.basePossible {
-			continue
-		}
-		lo, hi := p.lo, p.hi
-		if p.scan {
-			lo, hi = 0, v.base.rows()
-		}
-		if lo < hi {
-			qs.ivs = qs.ivs[:len(qs.ivs)+1]
-			qs.ivs[len(qs.ivs)-1] = iv{lo, hi}
-		}
-	}
-	// insertion sort by lo (n == len(groups): small in the common case,
-	// still O(n^2) worst case for pathologically large group counts):
-	// measured cheaper than slices.SortFunc, whose generic pdqsort machinery
-	// and closure call overhead dominate at typical sizes.
+	// Intervals arrive grouped by plan (a plan emits one per expanded IN
+	// combination), so they are only locally ordered: sort by lo, which is
+	// what the sweep's high-water dedup below and in every entry point needs.
 	n := len(qs.ivs)
-	for i := 1; i < n; i++ {
-		for j := i; j > 0 && qs.ivs[j].lo < qs.ivs[j-1].lo; j-- {
-			qs.ivs[j], qs.ivs[j-1] = qs.ivs[j-1], qs.ivs[j]
+	if n <= ivInsertionSortMax {
+		for i := 1; i < n; i++ {
+			for j := i; j > 0 && qs.ivs[j].lo < qs.ivs[j-1].lo; j-- {
+				qs.ivs[j], qs.ivs[j-1] = qs.ivs[j-1], qs.ivs[j]
+			}
 		}
+	} else {
+		slices.SortFunc(qs.ivs, func(a, b iv) int { return cmp.Compare(a.lo, b.lo) })
 	}
 	// Scan budget: after planning, total work is known before any row is
 	// touched. Sum the rows the sweep WILL visit, using the identical `done`
