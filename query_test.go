@@ -133,3 +133,101 @@ func randomRecord(rng *rand.Rand, card int) Record {
 		pick("s"), pick("a"), pick("p"), pick("c"), pick("o"),
 	)
 }
+
+// padConds repeats base cyclically until the result has n entries. Duplicate
+// equality conditions on the same dim/value are a harmless redundant AND, so
+// this is a simple way to build a group with more conditions than the
+// schema has distinct dims for — exactly what's needed to push a query's
+// total condition count over fastConds without a wider schema.
+func padConds(base []Cond, n int) []Cond {
+	out := make([]Cond, n)
+	for i := range out {
+		out[i] = base[i%len(base)]
+	}
+	return out
+}
+
+// TestQueryPooledScratchPath exercises the pooled (heap) scratch path end to
+// end. A legal query shape can exceed the stack fast path today (e.g. 3
+// groups of 11 equality conditions each: 33 total, over fastConds=32), and
+// every append inside plan()/resolveAggs on that path is a manual
+// reslice-then-set that panics on a sizing mistake in getPooledScratch —
+// this test is what stands between a silent bug there and an
+// out-of-bounds panic on real traffic. It runs every query twice: the
+// second call very likely gets back (via sync.Pool) the exact scratch the
+// first call released, so it also catches stale mets/ddims/acc/bms/
+// condDims/inWins/rWins leaking across queries.
+func TestQueryPooledScratchPath(t *testing.T) {
+	recs := numericRecords() // s1,a1,p1,10,ios / s1,a1,p2,25,android / s1,a2,p1,90,ios / s2,a2,p1,150,ios
+	s := numericStore(t, recs)
+
+	groupA := padConds([]Cond{ // row0 only: s1,a1,p1,ios
+		{Dim: "source", Value: "s1"}, {Dim: "account", Value: "a1"},
+		{Dim: "publisher", Value: "p1"}, {Dim: "os", Value: "ios"},
+	}, 11)
+	groupB := padConds([]Cond{ // row1 only: s1,a1,p2,android
+		{Dim: "source", Value: "s1"}, {Dim: "account", Value: "a1"},
+		{Dim: "publisher", Value: "p2"}, {Dim: "os", Value: "android"},
+	}, 11)
+	groupC := padConds([]Cond{ // row3 only: s2,a2,p1,ios
+		{Dim: "source", Value: "s2"}, {Dim: "account", Value: "a2"},
+		{Dim: "publisher", Value: "p1"}, {Dim: "os", Value: "ios"},
+	}, 11)
+	equalityOnly := [][]Cond{groupA, groupB, groupC}
+
+	aggs := []Agg{
+		{Op: AggCount},
+		{Metric: "visits", Op: AggSum},
+		{Metric: "revenue", Op: AggAvg},
+		{Op: AggDistinct, Dim: "os"},
+	}
+
+	if measureShape(equalityOnly, 0).fits() {
+		t.Fatal("33 conds across 3 groups must not fit the stack fast path")
+	}
+	if measureShape(equalityOnly, len(aggs)).fits() {
+		t.Fatal("shape with aggs must still route pooled")
+	}
+
+	for i := 0; i < 2; i++ {
+		got, err := s.QueryGroups(nil, equalityOnly)
+		if err != nil {
+			t.Fatalf("run %d: QueryGroups: %v", i, err)
+		}
+		assertSame(t, got, []float64{70, 3}) // row0+row1+row3: visits, revenue
+
+		gotAggs, err := s.QueryAggs(nil, aggs, equalityOnly)
+		if err != nil {
+			t.Fatalf("run %d: QueryAggs: %v", i, err)
+		}
+		assertSameNaN(t, gotAggs, []float64{3, 70, 1, 2}) // count, sum(visits), avg(revenue), distinct(os)
+	}
+
+	// Add a 4th group carrying an IN condition and a Range condition (well
+	// within the query-wide 16 IN conds / 128 IN values / 16 ranges
+	// limits), to also exercise inWins/inPool/rWins pooled sizing:
+	// publisher in {p1,p2} AND country (DimInt) in [10,100] pulls in row2
+	// (p1, country=90), which none of the equality-only groups match.
+	groupD := []Cond{
+		{Dim: "publisher", In: []string{"p1", "p2"}},
+		{Dim: "country", Range: &Range{Min: 10, Max: 100}},
+	}
+	withInAndRange := [][]Cond{groupA, groupB, groupC, groupD}
+	if measureShape(withInAndRange, 0).fits() {
+		t.Fatal("4-group shape with IN/range must still route pooled")
+	}
+
+	for i := 0; i < 2; i++ {
+		got, err := s.QueryGroups(nil, withInAndRange)
+		if err != nil {
+			t.Fatalf("run %d: QueryGroups: %v", i, err)
+		}
+		assertSame(t, got, []float64{100, 4}) // all four rows, each counted once
+
+		gotAggs, err := s.QueryAggs(nil, aggs, withInAndRange)
+		if err != nil {
+			t.Fatalf("run %d: QueryAggs: %v", i, err)
+		}
+		assertSameNaN(t, gotAggs, []float64{4, 100, 1, 2})
+	}
+}

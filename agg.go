@@ -29,19 +29,25 @@ const maxAggs = 16
 
 var errBadAggCount = errors.New("facetta: need 1..16 aggregates")
 
-// resolveAggs validates aggs and fills mets with each column's metric index
-// (-1 for AggCount/AggDistinct) and ddims with each column's distinct-dim
-// index (-1 for everything but AggDistinct). Fixed-size output, no
-// allocations on success.
-func (s *Store) resolveAggs(aggs []Agg, mets, ddims *[maxAggs]int) error {
+// resolveAggs validates aggs and appends each column's metric index (-1 for
+// AggCount/AggDistinct) to qs.mets and its distinct-dim index (-1 for
+// everything but AggDistinct) to qs.ddims. qs.mets/qs.ddims are pre-sized by
+// the caller's routing (scratchBack.fast or getPooledScratch), so these
+// appends (written as manual reslice-then-set, not `append` — see the
+// CAUTION on queryScratch) never reallocate.
+func (s *Store) resolveAggs(aggs []Agg, qs *queryScratch) error {
 	if len(aggs) == 0 || len(aggs) > maxAggs {
 		return errBadAggCount
 	}
-	for i, a := range aggs {
+	for _, a := range aggs {
 		if a.Op > AggDistinct {
 			return fmt.Errorf("facetta: unknown aggregate op %d", a.Op)
 		}
-		mets[i], ddims[i] = -1, -1
+		qs.mets = qs.mets[:len(qs.mets)+1]
+		qs.mets[len(qs.mets)-1] = -1
+		qs.ddims = qs.ddims[:len(qs.ddims)+1]
+		qs.ddims[len(qs.ddims)-1] = -1
+		j := len(qs.mets) - 1
 		if a.Op == AggDistinct {
 			if a.Metric != "" {
 				return fmt.Errorf("facetta: AggDistinct takes no metric, got %q", a.Metric)
@@ -50,7 +56,7 @@ func (s *Store) resolveAggs(aggs []Agg, mets, ddims *[maxAggs]int) error {
 			if di < 0 {
 				return fmt.Errorf("facetta: unknown dimension %q", a.Dim)
 			}
-			ddims[i] = di
+			qs.ddims[j] = di
 			continue
 		}
 		if a.Dim != "" {
@@ -72,7 +78,7 @@ func (s *Store) resolveAggs(aggs []Agg, mets, ddims *[maxAggs]int) error {
 		if mi < 0 {
 			return fmt.Errorf("facetta: unknown metric %q", a.Metric)
 		}
-		mets[i] = mi
+		qs.mets[j] = mi
 	}
 	return nil
 }
@@ -81,7 +87,7 @@ func (s *Store) resolveAggs(aggs []Agg, mets, ddims *[maxAggs]int) error {
 // overall first matched row (min/max initialization). Distinct columns
 // test-and-set the row's dim id in their bitmap and count new ids directly
 // in acc, so no popcount pass is needed at the end.
-func foldAgg(aggs []Agg, mets, ddims *[maxAggs]int, acc *[maxAggs]float64, bms *[maxAggs][]uint64, first bool, metric func(m int) float64, dimID func(d int) uint32) {
+func foldAgg(aggs []Agg, mets, ddims []int, acc []float64, bms [][]uint64, first bool, metric func(m int) float64, dimID func(d int) uint32) {
 	for j := range aggs {
 		if d := ddims[j]; d >= 0 {
 			id := dimID(d)
@@ -119,34 +125,63 @@ func foldAgg(aggs []Agg, mets, ddims *[maxAggs]int, acc *[maxAggs]float64, bms *
 // words). Over zero matched rows Sum, Count and Distinct are 0, and
 // Min/Max/Avg are NaN.
 func (s *Store) QueryAggs(dst []float64, aggs []Agg, groups [][]Cond) ([]float64, error) {
-	var mets, ddims [maxAggs]int
-	if err := s.resolveAggs(aggs, &mets, &ddims); err != nil {
+	// Routing is inlined here rather than behind a shared helper: see the
+	// comment on scratchBack for why.
+	sh := measureShape(groups, len(aggs))
+	var qs, pooled *queryScratch
+	var back scratchBack
+	var local queryScratch
+	if sh.fits() {
+		local = back.fast()
+		qs = &local
+	} else {
+		pooled = getPooledScratch(sh)
+		qs = pooled
+	}
+	out, err := s.queryAggs(dst, aggs, groups, qs)
+	// release only the pooled pointer, never &local: see the comment in
+	// QueryGroups for why calling release on the stack value would defeat
+	// its zero-alloc guarantee.
+	if pooled != nil {
+		pooled.release()
+	}
+	return out, err
+}
+
+func (s *Store) queryAggs(dst []float64, aggs []Agg, groups [][]Cond, qs *queryScratch) ([]float64, error) {
+	if err := s.resolveAggs(aggs, qs); err != nil {
 		return nil, err
 	}
 	v := s.view.Load()
 	// Distinct columns are the documented exception to zero allocations:
 	// one id bitmap each, sized by the dim's combined cardinality (known up
 	// front for this view). Queries without AggDistinct allocate nothing.
-	var bms [maxAggs][]uint64
+	// qs.bms may carry stale bitmaps (wrong size, or for a different dim)
+	// from an earlier query on a pooled/reused scratch, so every slot is
+	// reset to nil before the make loop below.
+	qs.bms = qs.bms[:len(aggs)]
+	for j := range qs.bms {
+		qs.bms[j] = nil
+	}
 	for j := range aggs {
-		if d := ddims[j]; d >= 0 {
+		if d := qs.ddims[j]; d >= 0 {
 			card := v.base.dicts[d].len() + v.extras[d].len()
-			bms[j] = make([]uint64, (card+63)/64)
+			qs.bms[j] = make([]uint64, (card+63)/64)
 		}
 	}
-	var plans [maxGroups]groupPlan
-	var ivs [maxGroups]iv
-	var ins queryIns
-	n, err := s.planGroups(v, groups, &plans, &ivs, &ins)
+	n, err := s.planGroups(v, groups, qs)
 	if err != nil {
 		return nil, err
 	}
 	baseExp, deltaExp, nowMilli := s.queryClock(v)
-	var acc [maxAggs]float64
+	qs.acc = qs.acc[:len(aggs)]
+	for j := range qs.acc {
+		qs.acc[j] = 0 // pooled slice may carry a previous query's values
+	}
 	rows := 0
 	done := 0
 	for i := 0; i < n; i++ {
-		lo, hi := ivs[i].lo, ivs[i].hi
+		lo, hi := qs.ivs[i].lo, qs.ivs[i].hi
 		if lo < done {
 			lo = done
 		}
@@ -163,10 +198,11 @@ func (s *Store) QueryAggs(dst []float64, aggs []Agg, groups [][]Cond) ([]float64
 				}
 			}
 			matched := false
-			for gi := range groups {
-				if plans[gi].matchBase(v, r) &&
-					(ins.pN[gi] == 0 || ins.matchIns(gi, v.base.dims, r)) &&
-					(ins.rN[gi] == 0 || ins.matchRanges(gi, v, v.base.dims, r)) {
+			for gi := range qs.plans {
+				p := &qs.plans[gi]
+				if p.matchBase(qs, v, r) &&
+					(p.insN == 0 || matchIns(qs.inWins[p.insOff:p.insOff+p.insN], qs.inPool, v.base.dims, r)) &&
+					(p.rngN == 0 || matchRanges(qs.rWins[p.rngOff:p.rngOff+p.rngN], v, v.base.dims, r)) {
 					matched = true
 					break
 				}
@@ -174,7 +210,7 @@ func (s *Store) QueryAggs(dst []float64, aggs []Agg, groups [][]Cond) ([]float64
 			if !matched {
 				continue
 			}
-			foldAgg(aggs, &mets, &ddims, &acc, &bms, rows == 0,
+			foldAgg(aggs, qs.mets, qs.ddims, qs.acc, qs.bms, rows == 0,
 				func(m int) float64 { return v.base.mets[m][r] },
 				func(dd int) uint32 { return v.base.dims[dd][r] })
 			rows++
@@ -189,10 +225,11 @@ func (s *Store) QueryAggs(dst []float64, aggs []Agg, groups [][]Cond) ([]float64
 			}
 		}
 		matched := false
-		for gi := range groups {
-			if plans[gi].matchDelta(d, r) &&
-				(ins.pN[gi] == 0 || ins.matchIns(gi, d.dims, r)) &&
-				(ins.rN[gi] == 0 || ins.matchRanges(gi, v, d.dims, r)) {
+		for gi := range qs.plans {
+			p := &qs.plans[gi]
+			if p.matchDelta(qs, d, r) &&
+				(p.insN == 0 || matchIns(qs.inWins[p.insOff:p.insOff+p.insN], qs.inPool, d.dims, r)) &&
+				(p.rngN == 0 || matchRanges(qs.rWins[p.rngOff:p.rngOff+p.rngN], v, d.dims, r)) {
 				matched = true
 				break
 			}
@@ -200,7 +237,7 @@ func (s *Store) QueryAggs(dst []float64, aggs []Agg, groups [][]Cond) ([]float64
 		if !matched {
 			continue
 		}
-		foldAgg(aggs, &mets, &ddims, &acc, &bms, rows == 0,
+		foldAgg(aggs, qs.mets, qs.ddims, qs.acc, qs.bms, rows == 0,
 			func(m int) float64 { return d.mets[m][r] },
 			func(dd int) uint32 { return d.dims[dd][r] })
 		rows++
@@ -212,11 +249,11 @@ func (s *Store) QueryAggs(dst []float64, aggs []Agg, groups [][]Cond) ([]float64
 		case AggCount:
 			out = float64(rows)
 		case AggSum, AggDistinct: // both accumulate directly; 0 over no rows
-			out = acc[j]
+			out = qs.acc[j]
 		default: // AggMin, AggMax, AggAvg: NaN over zero rows
 			out = math.NaN()
 			if rows > 0 {
-				out = acc[j]
+				out = qs.acc[j]
 				if aggs[j].Op == AggAvg {
 					out /= float64(rows)
 				}

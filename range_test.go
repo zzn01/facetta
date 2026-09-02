@@ -179,6 +179,21 @@ func TestCondRangeErrors(t *testing.T) {
 	if _, err := s.Query(nil, group); err == nil {
 		t.Fatal("too many ranges accepted")
 	}
+
+	// maxRanges is a per-QUERY total, not per-group: 9 ranges in one group
+	// plus 8 in another (17 total, neither group alone over the limit) must
+	// still be rejected.
+	g1 := make([]Cond, 0, 9)
+	for i := 0; i < 9; i++ {
+		g1 = append(g1, Cond{Dim: "country", Range: r})
+	}
+	g2 := make([]Cond, 0, 8)
+	for i := 0; i < 8; i++ {
+		g2 = append(g2, Cond{Dim: "country", Range: r})
+	}
+	if _, err := s.Query(nil, g1, g2); !errors.Is(err, errTooManyRanges) {
+		t.Fatalf("17 ranges split 9+8 across two groups: err = %v, want errTooManyRanges", err)
+	}
 }
 
 func TestCondRangeAggsAndGroupBy(t *testing.T) {

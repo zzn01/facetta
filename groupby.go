@@ -54,10 +54,34 @@ func (s *Store) QueryGroupBy(res *GroupedResult, by []string, aggs []Agg, groups
 	if res == nil {
 		return errNilResult
 	}
-	var mets, ddims [maxAggs]int
-	if err := s.resolveAggs(aggs, &mets, &ddims); err != nil {
+	// Routing is inlined here rather than behind a shared helper: see the
+	// comment on scratchBack for why.
+	sh := measureShape(groups, len(aggs))
+	var qs, pooled *queryScratch
+	var back scratchBack
+	var local queryScratch
+	if sh.fits() {
+		local = back.fast()
+		qs = &local
+	} else {
+		pooled = getPooledScratch(sh)
+		qs = pooled
+	}
+	err := s.queryGroupBy(res, by, aggs, groups, qs)
+	// release only the pooled pointer, never &local: see the comment in
+	// QueryGroups for why calling release on the stack value would defeat
+	// its zero-alloc guarantee.
+	if pooled != nil {
+		pooled.release()
+	}
+	return err
+}
+
+func (s *Store) queryGroupBy(res *GroupedResult, by []string, aggs []Agg, groups [][]Cond, qs *queryScratch) error {
+	if err := s.resolveAggs(aggs, qs); err != nil {
 		return err
 	}
+	mets, ddims := qs.mets, qs.ddims
 	hasDistinct := false
 	for j := range aggs {
 		if ddims[j] >= 0 {
@@ -81,10 +105,7 @@ func (s *Store) QueryGroupBy(res *GroupedResult, by []string, aggs []Agg, groups
 		byDims[i] = di
 	}
 	v := s.view.Load()
-	var plans [maxGroups]groupPlan
-	var ivs [maxGroups]iv
-	var ins queryIns
-	n, err := s.planGroups(v, groups, &plans, &ivs, &ins)
+	n, err := s.planGroups(v, groups, qs)
 	if err != nil {
 		return err
 	}
@@ -172,7 +193,7 @@ func (s *Store) QueryGroupBy(res *GroupedResult, by []string, aggs []Agg, groups
 
 	done := 0
 	for i := 0; i < n; i++ {
-		lo, hi := ivs[i].lo, ivs[i].hi
+		lo, hi := qs.ivs[i].lo, qs.ivs[i].hi
 		if lo < done {
 			lo = done
 		}
@@ -189,10 +210,11 @@ func (s *Store) QueryGroupBy(res *GroupedResult, by []string, aggs []Agg, groups
 				}
 			}
 			matched := false
-			for gi := range groups {
-				if plans[gi].matchBase(v, r) &&
-					(ins.pN[gi] == 0 || ins.matchIns(gi, v.base.dims, r)) &&
-					(ins.rN[gi] == 0 || ins.matchRanges(gi, v, v.base.dims, r)) {
+			for gi := range qs.plans {
+				p := &qs.plans[gi]
+				if p.matchBase(qs, v, r) &&
+					(p.insN == 0 || matchIns(qs.inWins[p.insOff:p.insOff+p.insN], qs.inPool, v.base.dims, r)) &&
+					(p.rngN == 0 || matchRanges(qs.rWins[p.rngOff:p.rngOff+p.rngN], v, v.base.dims, r)) {
 					matched = true
 					break
 				}
@@ -213,10 +235,11 @@ func (s *Store) QueryGroupBy(res *GroupedResult, by []string, aggs []Agg, groups
 			}
 		}
 		matched := false
-		for gi := range groups {
-			if plans[gi].matchDelta(d, r) &&
-				(ins.pN[gi] == 0 || ins.matchIns(gi, d.dims, r)) &&
-				(ins.rN[gi] == 0 || ins.matchRanges(gi, v, d.dims, r)) {
+		for gi := range qs.plans {
+			p := &qs.plans[gi]
+			if p.matchDelta(qs, d, r) &&
+				(p.insN == 0 || matchIns(qs.inWins[p.insOff:p.insOff+p.insN], qs.inPool, d.dims, r)) &&
+				(p.rngN == 0 || matchRanges(qs.rWins[p.rngOff:p.rngOff+p.rngN], v, d.dims, r)) {
 				matched = true
 				break
 			}

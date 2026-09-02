@@ -45,48 +45,29 @@ const (
 	maxRanges  = 16  // total range conditions per query
 )
 
-// queryIns is the per-query pool of resolved IN and range conditions,
-// shared by all
-// group plans: plan gi owns the contiguous window
-// [pOff[gi], pOff[gi]+pN[gi]) of dims/offs/lens, and condition k's candidate
-// ids live in pool[offs[k] : offs[k]+lens[k]]. Everything IN-related lives
-// here rather than in groupPlan so the frozen query path keeps its exact
-// stack scratch: declared arrays are zero-initialized on every call, and a
-// per-plan id array was measured to cost double-digit percentages on the
-// indexed query.
-type queryIns struct {
-	nConds int
-	nIDs   int
-	pOff   [maxGroups]uint8 // per-plan window start into dims/offs/lens
-	pN     [maxGroups]uint8 // per-plan window length
-	dims   [maxInConds]uint8
-	offs   [maxInConds]uint16
-	lens   [maxInConds]uint8
-	pool   [maxInIDs]uint32
-
-	// range conditions, same per-plan windowing (rOff/rN over rDims/rMin/rMax)
-	nRanges int
-	rOff    [maxGroups]uint8
-	rN      [maxGroups]uint8
-	rDims   [maxRanges]uint8
-	rMin    [maxRanges]int64
-	rMax    [maxRanges]int64
-}
-
+// groupPlan is one OR-group's resolved plan. condOff/condN, insOff/insN and
+// rngOff/rngN are offset+count pairs into the query's queryScratch pools
+// (condDims/condIDs, inWins, rWins) — NOT materialized sub-slices. See the
+// CAUTION on queryScratch for why: storing an actual []int32/[]inWindow/
+// []rangeWindow into a groupPlan held in qs.plans (an indexed slice) forces
+// the whole per-query scratch onto the heap, unconditionally, regardless of
+// inlining or of using an array instead of a slice for qs.plans. groupPlan
+// itself holds no backing storage.
 type groupPlan struct {
-	nConds       int
-	condDims     [maxConds]int
-	condIDs      [maxConds]uint32
-	lo, hi       int  // base candidate row interval
-	scan         bool // full base scan
-	dead         bool // matches nothing anywhere
-	basePossible bool // some base row could satisfy every cond
+	condOff, condN int32 // equality conds: offset+count into qs.condDims/condIDs
+	insOff, insN   int32 // offset+count into qs.inWins
+	rngOff, rngN   int32 // offset+count into qs.rWins
+	lo, hi         int   // base candidate row interval
+	scan           bool  // full base scan
+	dead           bool  // matches nothing anywhere
+	basePossible   bool  // some base row could satisfy every cond
 }
 
 // plan resolves one group against v: dict-encodes conditions, finds the
 // longest fully-specified index-dim prefix and binary-searches its key range.
-// ins may be nil only when no condition in g uses In (see hasInConds).
-func (v *view) plan(sc *Schema, g []Cond, p *groupPlan, ins *queryIns) error {
+// All variable-length outputs live in qs pools; p holds offset+count views
+// (see the comment on groupPlan for why not sub-slices).
+func (v *view) plan(sc *Schema, g []Cond, p *groupPlan, qs *queryScratch) error {
 	*p = groupPlan{basePossible: true}
 	if len(g) > maxConds {
 		return errTooManyConds
@@ -95,6 +76,9 @@ func (v *view) plan(sc *Schema, g []Cond, p *groupPlan, ins *queryIns) error {
 		p.scan = true // empty group matches every row
 		return nil
 	}
+	condOff := len(qs.condDims)
+	inOff := len(qs.inWins)
+	rOff := len(qs.rWins)
 	for _, c := range g {
 		di := sc.dimIndex(c.Dim)
 		if di < 0 {
@@ -107,23 +91,21 @@ func (v *view) plan(sc *Schema, g []Cond, p *groupPlan, ins *queryIns) error {
 			if !sc.isInt(di) {
 				return fmt.Errorf("facetta: dimension %q is not DimInt", c.Dim)
 			}
-			if ins.nRanges == maxRanges {
+			if len(qs.rWins) == maxRanges {
 				return errTooManyRanges
 			}
-			k := ins.nRanges
-			ins.rDims[k] = uint8(di)
-			ins.rMin[k], ins.rMax[k] = c.Range.Min, c.Range.Max
-			ins.nRanges++
+			qs.rWins = qs.rWins[:len(qs.rWins)+1]
+			qs.rWins[len(qs.rWins)-1] = rangeWindow{dim: int32(di), min: c.Range.Min, max: c.Range.Max}
 			continue
 		}
 		if len(c.In) > 0 {
 			if c.Value != "" {
 				return errCondValueAndIn
 			}
-			if len(c.In) > maxInVals || ins.nConds == maxInConds {
+			if len(c.In) > maxInVals || len(qs.inWins) == maxInConds {
 				return errTooManyInValues
 			}
-			off, cnt := ins.nIDs, 0
+			off := len(qs.inPool)
 			anyBase := false
 			for _, val := range c.In {
 				var id uint32
@@ -140,25 +122,21 @@ func (v *view) plan(sc *Schema, g []Cond, p *groupPlan, ins *queryIns) error {
 				if !ok {
 					continue // value nowhere in the table: drop from the set
 				}
-				if off+cnt == maxInIDs {
+				if len(qs.inPool) == maxInIDs {
 					return errTooManyInValues
 				}
-				ins.pool[off+cnt] = id
-				cnt++
+				qs.inPool = qs.inPool[:len(qs.inPool)+1]
+				qs.inPool[len(qs.inPool)-1] = id
 				if int(id) < v.base.dicts[di].len() {
 					anyBase = true
 				}
 			}
-			if cnt == 0 {
+			if len(qs.inPool) == off {
 				p.dead = true // no listed value exists anywhere
 				return nil
 			}
-			k := ins.nConds
-			ins.dims[k] = uint8(di)
-			ins.offs[k] = uint16(off)
-			ins.lens[k] = uint8(cnt)
-			ins.nConds++
-			ins.nIDs = off + cnt
+			qs.inWins = qs.inWins[:len(qs.inWins)+1]
+			qs.inWins[len(qs.inWins)-1] = inWindow{dim: int32(di), off: int32(off), n: int32(len(qs.inPool) - off)}
 			if !anyBase {
 				p.basePossible = false // every candidate id is delta-only
 			}
@@ -179,13 +157,20 @@ func (v *view) plan(sc *Schema, g []Cond, p *groupPlan, ins *queryIns) error {
 			p.dead = true // value nowhere in the table
 			return nil
 		}
-		p.condDims[p.nConds] = di
-		p.condIDs[p.nConds] = id
-		p.nConds++
+		qs.condDims = qs.condDims[:len(qs.condDims)+1]
+		qs.condDims[len(qs.condDims)-1] = int32(di)
+		qs.condIDs = qs.condIDs[:len(qs.condIDs)+1]
+		qs.condIDs[len(qs.condIDs)-1] = id
 	}
+	// Offset+count captured now, after this group's conds are fully appended
+	// above: see the CAUTION on queryScratch for why that ordering matters.
+	p.condOff, p.condN = int32(condOff), int32(len(qs.condDims)-condOff)
+	p.insOff, p.insN = int32(inOff), int32(len(qs.inWins)-inOff)
+	p.rngOff, p.rngN = int32(rOff), int32(len(qs.rWins)-rOff)
 	base := v.base
-	for i := 0; i < p.nConds; i++ {
-		if int(p.condIDs[i]) >= base.dicts[p.condDims[i]].len() {
+	for i := int32(0); i < p.condN; i++ {
+		d := qs.condDims[p.condOff+i]
+		if int(qs.condIDs[p.condOff+i]) >= base.dicts[d].len() {
 			p.basePossible = false // delta-only value: no base row can match
 		}
 	}
@@ -194,9 +179,10 @@ func (v *view) plan(sc *Schema, g []Cond, p *groupPlan, ins *queryIns) error {
 	}
 	var pref [maxDims]uint32
 	var has [maxDims]bool
-	for i := 0; i < p.nConds; i++ {
-		if d := p.condDims[i]; d < sc.IndexDims {
-			has[d], pref[d] = true, p.condIDs[i]
+	for i := int32(0); i < p.condN; i++ {
+		d := qs.condDims[p.condOff+i]
+		if int(d) < sc.IndexDims {
+			has[d], pref[d] = true, qs.condIDs[p.condOff+i]
 		}
 	}
 	k := 0
@@ -217,21 +203,21 @@ func (v *view) plan(sc *Schema, g []Cond, p *groupPlan, ins *queryIns) error {
 	return nil
 }
 
-// matchIns checks plan gi's IN conditions against one row's dim ids. It is
-// deliberately NOT folded into matchBase/matchDelta: their bodies sit under
-// the compiler's inline budget and the per-row sweeps rely on that; adding
-// the IN logic (or even a call to it) pushes them over and costs ~20% on the
-// indexed hot path (measured). Call sites short-circuit on `ins == nil ||
-// ins.pN[gi] == 0` instead, so queries without IN conditions pay one
-// never-taken branch per matched row and nothing else.
-func (q *queryIns) matchIns(gi int, dims [][]uint32, r int) bool {
-	off := int(q.pOff[gi])
-	for k := off; k < off+int(q.pN[gi]); k++ {
-		id := dims[q.dims[k]][r]
-		lo, hi := int(q.offs[k]), int(q.offs[k])+int(q.lens[k])
+// matchIns checks a plan's IN conditions against one row's dim ids. ins is a
+// freshly-sliced view built by the caller (qs.inWins[p.insOff:p.insOff+p.insN])
+// and pool is qs.inPool, needed to resolve each window's off/n into actual
+// candidate ids (see the comment on groupPlan for why inWindow doesn't hold
+// its own []uint32). It is deliberately NOT folded into matchBase/matchDelta:
+// their bodies sit under the compiler's inline budget and the per-row sweeps
+// rely on that; adding the IN logic (or even a call to it) pushes them over
+// and costs ~20% on the indexed hot path (measured). Call sites short-circuit
+// on p.insN == 0.
+func matchIns(ins []inWindow, pool []uint32, dims [][]uint32, r int) bool {
+	for _, w := range ins {
+		id := dims[w.dim][r]
 		ok := false
-		for j := lo; j < hi; j++ {
-			if id == q.pool[j] {
+		for _, c := range pool[w.off : w.off+w.n] {
+			if id == c {
 				ok = true
 				break
 			}
@@ -243,13 +229,14 @@ func (q *queryIns) matchIns(gi int, dims [][]uint32, r int) bool {
 	return true
 }
 
-// matchRanges checks plan gi's range conditions against one row's dim ids,
-// resolving parsed values through the view's combined id space. Kept out of
-// matchBase/matchDelta for the same inline-budget reason as matchIns.
-func (q *queryIns) matchRanges(gi int, v *view, dims [][]uint32, r int) bool {
-	off := int(q.rOff[gi])
-	for k := off; k < off+int(q.rN[gi]); k++ {
-		d := int(q.rDims[k])
+// matchRanges checks a plan's range conditions against one row's dim ids,
+// resolving values through the view's combined id space. rngs is a
+// freshly-sliced view built by the caller (qs.rWins[p.rngOff:p.rngOff+p.rngN]).
+// Kept out of matchBase/matchDelta for the same inline-budget reason as
+// matchIns.
+func matchRanges(rngs []rangeWindow, v *view, dims [][]uint32, r int) bool {
+	for _, w := range rngs {
+		d := int(w.dim)
 		id := dims[d][r]
 		var val int64
 		if n := uint32(v.base.dicts[d].len()); id >= n {
@@ -257,38 +244,41 @@ func (q *queryIns) matchRanges(gi int, v *view, dims [][]uint32, r int) bool {
 		} else {
 			val = v.base.dicts[d].vals[id]
 		}
-		if val < q.rMin[k] || val > q.rMax[k] {
+		if val < w.min || val > w.max {
 			return false
 		}
 	}
 	return true
 }
 
-// matchBase checks equality conditions only; IN conditions are checked by the
-// caller via matchIns (see its comment for why).
-func (p *groupPlan) matchBase(v *view, r int) bool {
+// matchBase checks equality conditions only; IN and range conditions are
+// checked by the caller via matchIns/matchRanges (see their comments for why).
+// qs supplies the condDims/condIDs pools p's condOff/condN index into.
+func (p *groupPlan) matchBase(qs *queryScratch, v *view, r int) bool {
 	if p.dead || !p.basePossible {
 		return false
 	}
 	if !p.scan && (r < p.lo || r >= p.hi) {
 		return false
 	}
-	for i := 0; i < p.nConds; i++ {
-		if v.base.dims[p.condDims[i]][r] != p.condIDs[i] {
+	for i := int32(0); i < p.condN; i++ {
+		d := qs.condDims[p.condOff+i]
+		if v.base.dims[d][r] != qs.condIDs[p.condOff+i] {
 			return false
 		}
 	}
 	return true
 }
 
-// matchDelta checks equality conditions only; IN conditions are checked by
-// the caller via matchIns (see its comment for why).
-func (p *groupPlan) matchDelta(d *delta, r int) bool {
+// matchDelta checks equality conditions only; IN and range conditions are
+// checked by the caller via matchIns/matchRanges (see their comments for why).
+func (p *groupPlan) matchDelta(qs *queryScratch, d *delta, r int) bool {
 	if p.dead {
 		return false
 	}
-	for i := 0; i < p.nConds; i++ {
-		if d.dims[p.condDims[i]][r] != p.condIDs[i] {
+	for i := int32(0); i < p.condN; i++ {
+		dd := qs.condDims[p.condOff+i]
+		if d.dims[dd][r] != qs.condIDs[p.condOff+i] {
 			return false
 		}
 	}
@@ -299,36 +289,27 @@ func (p *groupPlan) matchDelta(d *delta, r int) bool {
 type iv struct{ lo, hi int }
 
 // planGroups plans every group against v, collects the deduped base candidate
-// intervals sorted by lo, and enforces the scan budget. It fills the caller's
-// fixed-size arrays and performs no heap allocations, so every query entry
-// point (QueryGroups, QueryAggs, QueryGroupBy) shares one planner.
-func (s *Store) planGroups(v *view, groups [][]Cond, plans *[maxGroups]groupPlan, ivs *[maxGroups]iv, ins *queryIns) (int, error) {
+// intervals sorted by lo, and enforces the scan budget. Plans land in
+// qs.plans and intervals in qs.ivs (both pools sized/reset by the caller's
+// routing before this is called — see the comment on scratchBack), so every
+// query entry point (QueryGroups, QueryAggs, QueryGroupBy) shares one planner.
+func (s *Store) planGroups(v *view, groups [][]Cond, qs *queryScratch) (int, error) {
 	if len(groups) == 0 || len(groups) > maxGroups {
 		return 0, errBadGroupCount
 	}
 	sc := &s.sc
+	qs.plans = qs.plans[:len(groups)]
 	for gi := range groups {
-		off, roff := 0, 0
-		if ins != nil {
-			off, roff = ins.nConds, ins.nRanges
-		}
-		if err := v.plan(sc, groups[gi], &plans[gi], ins); err != nil {
+		if err := v.plan(sc, groups[gi], &qs.plans[gi], qs); err != nil {
 			return 0, err
 		}
-		if ins != nil {
-			ins.pOff[gi] = uint8(off)
-			ins.pN[gi] = uint8(ins.nConds - off)
-			ins.rOff[gi] = uint8(roff)
-			ins.rN[gi] = uint8(ins.nRanges - roff)
-		}
-		if plans[gi].scan {
+		if qs.plans[gi].scan {
 			s.st.fullScans.Add(1)
 		}
 	}
 	// collect base candidate intervals for the union sweep
-	n := 0
-	for gi := range groups {
-		p := &plans[gi]
+	for gi := range qs.plans {
+		p := &qs.plans[gi]
 		if p.dead || !p.basePossible {
 			continue
 		}
@@ -337,14 +318,17 @@ func (s *Store) planGroups(v *view, groups [][]Cond, plans *[maxGroups]groupPlan
 			lo, hi = 0, v.base.rows()
 		}
 		if lo < hi {
-			ivs[n] = iv{lo, hi}
-			n++
+			qs.ivs = qs.ivs[:len(qs.ivs)+1]
+			qs.ivs[len(qs.ivs)-1] = iv{lo, hi}
 		}
 	}
-	// insertion sort by lo (n <= 16)
+	// insertion sort by lo (n is small, bounded by fastGroups/maxGroups):
+	// measured cheaper than slices.SortFunc, whose generic pdqsort machinery
+	// and closure call overhead dominate at this size.
+	n := len(qs.ivs)
 	for i := 1; i < n; i++ {
-		for j := i; j > 0 && ivs[j].lo < ivs[j-1].lo; j-- {
-			ivs[j], ivs[j-1] = ivs[j-1], ivs[j]
+		for j := i; j > 0 && qs.ivs[j].lo < qs.ivs[j-1].lo; j-- {
+			qs.ivs[j], qs.ivs[j-1] = qs.ivs[j-1], qs.ivs[j]
 		}
 	}
 	// Scan budget: after planning, total work is known before any row is
@@ -358,7 +342,7 @@ func (s *Store) planGroups(v *view, groups [][]Cond, plans *[maxGroups]groupPlan
 		scanRows := v.delta.rows()
 		hw := 0 // mirrors the sweep's `done`
 		for i := 0; i < n; i++ {
-			lo, hi := ivs[i].lo, ivs[i].hi
+			lo, hi := qs.ivs[i].lo, qs.ivs[i].hi
 			if lo < hw {
 				lo = hw
 			}
@@ -391,37 +375,40 @@ func (s *Store) queryClock(v *view) (baseExp, deltaExp bool, nowMilli int64) {
 	return baseExp, deltaExp, nowMilli
 }
 
-// hasFilterConds reports whether any group carries an IN or range condition.
-func hasFilterConds(groups [][]Cond) bool {
-	for _, g := range groups {
-		for _, c := range g {
-			if len(c.In) > 0 || c.Range != nil {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 // QueryGroups sums all metrics over rows matching ANY group. dst is reused
-// when cap(dst) >= len(Metrics); the call performs zero heap allocations.
+// when cap(dst) >= len(Metrics); the call performs zero heap allocations for
+// query shapes that fit the stack scratch (see queryScratch).
 func (s *Store) QueryGroups(dst []float64, groups [][]Cond) ([]float64, error) {
-	// The IN/range scratch pool lives in this thin wrapper and only when
-	// needed: zero-initializing it on every call costs ~15% on the indexed
-	// fast path (measured), so queries without In or Range pass nil and
-	// never pay it.
-	if !hasFilterConds(groups) {
-		return s.queryGroups(dst, groups, nil)
+	// Routing is inlined here rather than behind a shared helper: see the
+	// comment on scratchBack for why (a shared version isn't inlinable and
+	// costs a real function-call boundary on every query).
+	sh := measureShape(groups, 0)
+	var qs, pooled *queryScratch
+	var back scratchBack
+	var local queryScratch
+	if sh.fits() {
+		local = back.fast()
+		qs = &local
+	} else {
+		pooled = getPooledScratch(sh)
+		qs = pooled
 	}
-	var ins queryIns
-	return s.queryGroups(dst, groups, &ins)
+	out, err := s.queryGroups(dst, groups, qs)
+	// release only the pooled pointer, never &local (equivalently, never qs
+	// itself): calling release on a value that might be the stack-backed
+	// local forces local (and back) onto the heap, because release's body
+	// can reach sync.Pool.Put — see the CAUTION on queryScratch. release is
+	// a no-op for stack scratches anyway, so skipping it here changes
+	// nothing at runtime.
+	if pooled != nil {
+		pooled.release()
+	}
+	return out, err
 }
 
-func (s *Store) queryGroups(dst []float64, groups [][]Cond, ins *queryIns) ([]float64, error) {
+func (s *Store) queryGroups(dst []float64, groups [][]Cond, qs *queryScratch) ([]float64, error) {
 	v := s.view.Load()
-	var plans [maxGroups]groupPlan
-	var ivs [maxGroups]iv
-	n, err := s.planGroups(v, groups, &plans, &ivs, ins)
+	n, err := s.planGroups(v, groups, qs)
 	if err != nil {
 		return nil, err
 	}
@@ -432,7 +419,7 @@ func (s *Store) queryGroups(dst []float64, groups [][]Cond, ins *queryIns) ([]fl
 	}
 	done := 0
 	for i := 0; i < n; i++ {
-		lo, hi := ivs[i].lo, ivs[i].hi
+		lo, hi := qs.ivs[i].lo, qs.ivs[i].hi
 		if lo < done {
 			lo = done
 		}
@@ -448,10 +435,11 @@ func (s *Store) queryGroups(dst []float64, groups [][]Cond, ins *queryIns) ([]fl
 					continue // expired: invisible to queries
 				}
 			}
-			for gi := range groups {
-				if plans[gi].matchBase(v, r) && (ins == nil ||
-					((ins.pN[gi] == 0 || ins.matchIns(gi, v.base.dims, r)) &&
-						(ins.rN[gi] == 0 || ins.matchRanges(gi, v, v.base.dims, r)))) {
+			for gi := range qs.plans {
+				p := &qs.plans[gi]
+				if p.matchBase(qs, v, r) &&
+					(p.insN == 0 || matchIns(qs.inWins[p.insOff:p.insOff+p.insN], qs.inPool, v.base.dims, r)) &&
+					(p.rngN == 0 || matchRanges(qs.rWins[p.rngOff:p.rngOff+p.rngN], v, v.base.dims, r)) {
 					for m := range dst {
 						dst[m] += v.base.mets[m][r]
 					}
@@ -469,10 +457,11 @@ func (s *Store) queryGroups(dst []float64, groups [][]Cond, ins *queryIns) ([]fl
 				continue // expired: invisible to queries
 			}
 		}
-		for gi := range groups {
-			if plans[gi].matchDelta(d, r) && (ins == nil ||
-				((ins.pN[gi] == 0 || ins.matchIns(gi, d.dims, r)) &&
-					(ins.rN[gi] == 0 || ins.matchRanges(gi, v, d.dims, r)))) {
+		for gi := range qs.plans {
+			p := &qs.plans[gi]
+			if p.matchDelta(qs, d, r) &&
+				(p.insN == 0 || matchIns(qs.inWins[p.insOff:p.insOff+p.insN], qs.inPool, d.dims, r)) &&
+				(p.rngN == 0 || matchRanges(qs.rWins[p.rngOff:p.rngOff+p.rngN], v, d.dims, r)) {
 				for m := range dst {
 					dst[m] += d.mets[m][r]
 				}
