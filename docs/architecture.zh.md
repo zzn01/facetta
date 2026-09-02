@@ -44,7 +44,7 @@
 | `snapshot.go` | 424 | 不可变列式基底;全量构建(`buildFromRecords`)与归并(`mergeView`/`zipMerge`) |
 | `view.go` | 227 | `view`/`delta` 结构;写路径 `applyDelta`(copy-on-write) |
 | `store.go` | 193 | `Store` 门面:原子指针、写锁、`Apply`/`Compact`/`ReplaceAll` |
-| `query.go` | 470 | `Cond`(等值/IN/范围),共享规划器(`planGroups`),`QueryGroups`,扫描预算 |
+| `query.go` | 692 | `Cond`(等值/IN/范围),共享规划器(`planGroups`),`QueryGroups`,扫描预算 |
 | `agg.go` | 179 | `Agg`/`AggOp` 聚合选择,`QueryAggs`(零分配) |
 | `groupby.go` | 226 | `QueryGroupBy` 哈希聚合,产出可复用的 `GroupedResult` |
 | `compactor.go` | 89 | 可选后台压实策略(何时调 `Compact`) |
@@ -110,8 +110,12 @@ view.Load()                          ── 唯一一次原子读,之后全程�
   │                                     · 值只在 extras 里 → basePossible=false,跳过基底只扫 delta
   │                                     · 无可用前缀 → scan(全基底扫描,计入 Stats.FullScans)
   │
-  ├─ 区间并集                        ── ≤16 个区间按 lo 插入排序(栈上数组),
-  │                                     用高水位 done 去重,重叠区间只扫一次
+  ├─ 区间并集                        ── 基底候选区间(qs.ivs)按 lo 排序——不超过
+  │                                     32 个区间用插入排序,更多则用
+  │                                     slices.SortFunc(实测在这个交叉点以上更
+  │                                     便宜)——用高水位 done 去重,重叠区间只扫
+  │                                     一次。区间数不再与组数绑定:下面的 IN
+  │                                     索引展开可能让一个组产出好几个区间
   │
   ├─ 扫描预算(可选)                 ── 规划完、未碰任何行时,将要访问的行数已完全可知:
   │                                     去重后的基底候选行 + delta 行数 > MaxScanRows
@@ -123,9 +127,16 @@ view.Load()                          ── 唯一一次原子读,之后全程�
   └─ 线性扫 delta                    ── 同样的过期跳过 + 逐组匹配
 ```
 
-**零堆分配靠什么**:所有 scratch(`plans`、`ivs`)都是 `maxGroups`/`maxConds` 定长
-的栈上数组;`dst` 由调用方复用;错误哨兵预分配。`TestQueryZeroAlloc` 是绊线,
-任何热路径改动必须保持它绿。
+**零堆分配靠什么**:每次查询先测量自己的形态(`measureShape`,`scratch.go`),再路由到
+两个 scratch 来源之一。落在栈容量之内的形态(16 组 / 32 个等值条件 / 16 个 IN 条件 /
+128 个 IN 值 / 16 个 range / 16 个聚合列,外加 `ivs` 的 16 区间底线)跑在
+`scratchBack` 上——它是调用方自己栈帧里的一个局部变量,其 `queryScratch` 指针永不
+逃逸。更大的形态则从 `sync.Pool` 借一份 scratch,按形态自身的*输入*计数精确定尺寸
+(所以路由结果与表内容无关,是确定的),形态带任意 IN 条件时再加上 4096 个区间的
+额度(供下面的索引展开使用)。归还时保留容量超过 1MB 的池化 scratch 会被丢弃而不是
+放回池,这样一次病态查询不会为之后每一次查询钉住一大块内存。`dst` 由调用方复用;
+错误哨兵预分配。`TestQueryZeroAlloc`(栈路径)与 `TestQueryZeroAllocLarge`(池路径,
+稳态)是绊线,任何热路径改动都必须让两者保持绿色。
 
 **过期检查也是按需的**:视图里没有任何可过期行(`base.minExpire==0 && !delta.hasExpiry`)
 时,连 `now` 都不采样,expire 列一次都不碰;基底最早过期时刻还在未来时同样整体跳过。
@@ -158,12 +169,29 @@ seen-(列, 组, id) 集合逐组去重。它的分配是每次调用 O(结果组
 为一个 id 会触发条目计数校验),因此在该维声明为 DimInt 之前写出的快照会被
 拒绝,进入回退全量拉取。
 
-IN 条件(`Cond.In`)被解析进按查询一份的 id 池(`queryIns`)而不是 `groupPlan`,
-并由调用点的 `matchIns` 检查,而不是放进 `matchBase`/`matchDelta` 内部。两处摆放
-都是刻意的热路径保护,合并前经过实测:按 plan 一份的 id 数组会让 plans 的栈
-scratch 膨胀一个数量级(而它们每次查询都要全量清零初始化);把 IN 检查折进匹配器
-会把它们推出编译器的内联预算 —— 两者都会让索引查询付出两位数百分比的代价。
-不含 IN 的查询传入 nil 池,每个命中行只多付一次永不成立的分支。
+IN 条件(`Cond.In`)被解析进按查询一份 scratch 的 `inWins`/`inPool` 池
+(`scratch.go`),而不是 `groupPlan` 自身——`groupPlan` 只持有指向这些池的
+偏移量+计数视图,原因与 `queryScratch` 上 CAUTION 注释所述的逃逸分析问题相同:
+把一个真正的切片存进位于被索引切片(`qs.plans`)内的 `groupPlan`,会不管是否
+内联都无条件把整个按查询 scratch 逼上堆。每个 IN 窗口的候选 id 在规划时排序一次;
+之后 `matchIns`/`matchOneIn`(`query.go`)对不超过 16 个 id 的窗口线性探测,更大的
+窗口则改用二分查找,把大窗口上的逐行成员判断从 O(n) 变成 O(log n)。池而非
+`groupPlan` 的摆放位置,以及把 IN 检查排除在 `matchBase`/`matchDelta` 之外,都是
+经过实测的刻意热路径保护:把检查折进匹配器会把它们推出编译器的内联预算(实测在
+索引查询上退化约 20%);要让 `matchIns` 本身在它自己的调用点保持可内联,还需要把
+线性/二分逻辑拆进一个 `go:noinline` 的 `matchOneIn`(具体是哪部分内联预算算术
+逼出这个拆分,见 `matchIns` 上的注释)。不含 IN 的查询每个命中行只多付一次
+永不成立的分支。
+
+前导索引维度上的 IN 条件还会额外加入索引前缀规划,而不只是过滤行:`planExpand`
+(`query.go`)把它展开成每个已解析 id 一条候选键区间——若干个索引前缀维度各自带
+IN 时就是跨维度的笛卡尔积——由一个跑遍已覆盖前缀的里程表(odometer)生成。展开是
+有预算的,不是无条件的:只有当组合数乘以 ⌈log₂ 行数⌉ 仍低于全表扫描的行数、且
+共享的区间容器仍有余量时,才会把前缀再扩展一个 IN 维度(池路径上面的 4096
+区间额度;栈路径上的余量只剩每个组自己的预留位之外、尚未被后面组占用的那些——
+为什么"多个组各带 IN"的形态会被路由到池、而不是留下来争夺那几个槽位,见
+`fastIvs` 上的注释,`scratch.go`)。任一预算不够都会退化为全表扫描,和未覆盖前缀
+过去一直做的一样。
 
 ## 写路径:Apply 的 copy-on-write(`view.go:113`)
 

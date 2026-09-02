@@ -109,9 +109,10 @@ for i := 0; i < res.N; i++ {
 Semantics and limits:
 
 - **`QueryAggs`** supports `AggSum`, `AggCount`, `AggMin`, `AggMax`, `AggAvg`
-  and `AggDistinct` (up to 16 columns). Over zero matched rows Sum/Count/
-  Distinct are 0 and Min/Max/Avg are **NaN** (the float64 stand-in for SQL
-  NULL). Zero heap allocations, same as `QueryGroups` — except `AggDistinct`.
+  and `AggDistinct`, with no cap on the number of output columns. Over zero
+  matched rows Sum/Count/Distinct are 0 and Min/Max/Avg are **NaN** (the
+  float64 stand-in for SQL NULL). Zero heap allocations, same as
+  `QueryGroups` — except `AggDistinct`.
 - **`AggDistinct`** is an **exact** `COUNT(DISTINCT Dim)`: dictionary
   encoding turns the value set into an id bitmap sized by the dim's known
   cardinality, so each distinct column costs one bitmap allocation
@@ -120,11 +121,21 @@ Semantics and limits:
   `QueryGroupBy`, distinct counting is per group via a seen-triple set, so
   its allocations grow with unique (group, value) pairs — worst case
   O(matched rows).
-- **`Cond.In`** filters rows during the scan but does **not** contribute to
-  index-prefix planning: a group whose leading index dims carry only IN
-  conditions degrades to a full scan (fail-fast guarded by `MaxScanRows`).
-  For indexed multi-value queries use one group per value instead. Caps: 16
-  values per condition, 16 IN conditions / 128 resolved values per query.
+- **`Cond.In`** filters rows during the scan, and — on a leading index
+  dimension — also joins index-prefix planning: the planner expands it into
+  one candidate key interval per resolved value (a cartesian product across
+  dims when several index-prefix dims each carry an IN), so an indexed
+  multi-value filter stays indexed instead of degrading to a scan. Expansion
+  is budgeted against the cost of a full scan and falls back to one when it
+  wouldn't pay off; on the stack fast path it additionally shares a small,
+  fixed interval budget with the rest of the query, so a shape combining
+  several IN-carrying groups is routed to a larger (still zero-allocation
+  in steady state) pooled scratch instead of risking one group's expansion
+  starving another's. `In` has no count limit — values absent from the
+  table are simply dropped from the set — and `Config.MaxScanRows` is the
+  only guard against an expensive shape. See
+  [docs/design-rationale.md](docs/design-rationale.md#lifting-the-query-shape-limits)
+  for the full story.
 - **`Cond.Range`** is a closed integer interval (`math.MinInt64`/`MaxInt64`
   for open ends) on a dim declared with `Type: DimInt` — encode times as
   unix timestamps, fractional buckets as minor units (the same discipline as
@@ -139,8 +150,11 @@ Semantics and limits:
   error rather than silently mismatch. Parsing happens once per dictionary
   entry at insertion, never on the query path: a range check is two integer
   comparisons per row, zero allocations (canonicalizing condition values is
-  allocation-free too). Like IN, ranges filter rows but do not join
-  index-prefix planning. The snapshot format is unchanged; a snapshot
+  allocation-free too). Unlike IN, ranges never join index-prefix planning —
+  dictionary ids are assigned in first-appearance order, not by value, so
+  numerically adjacent ids don't imply adjacent integers and a range can't
+  be turned into a contiguous slice of the key-sorted base. The snapshot
+  format is unchanged; a snapshot
   holding non-canonical values for an integer dim is refused at load and
   falls back to a full pull. `Dim.Type` is where future per-dimension
   semantics will slot in (a `DimFloat` would be an additive change) — the
@@ -182,20 +196,20 @@ For deadline-sensitive callers, a slow answer is worse than an instant refusal. 
 - **`Config.MaxScanRows`** (store-level) caps per-query scan *work*. After planning, the total work is known before any row is touched: the merged base candidate intervals plus the delta row count. If that sum exceeds the budget, the query returns `ErrScanBudget` immediately — no rows scanned, zero heap allocation on the refusal path. A full scan's `[0,N)` span naturally trips any sane budget on a large table, so there is no separate "no full scans" flag.
 - **`CompactorConfig.MaxDeltaRows`** (compactor-level) keeps the delta small so its unconditional linear scan never dominates.
 
-Both bound **work** (rows visited), not wall-clock. Measured per-row cost is **~7 ns/row** (from `BenchmarkQueryFullScan1M`); index range location is a binary search:
+Both bound **work** (rows visited), not wall-clock. Measured per-row cost is **~6.4 ns/row** (from `BenchmarkQueryFullScan1M`); index range location is a binary search:
 
 ```
-worst-case scan work ≈ log₂(N) steps  +  (MaxScanRows + MaxDeltaRows) × ~6 ns/row
+worst-case scan work ≈ log₂(N) steps  +  (MaxScanRows + MaxDeltaRows) × ~6.4 ns/row
 example: N = 30M, MaxScanRows = 10_000, MaxDeltaRows = 50_000
-       ≈ 25 steps  +  60_000 × 7 ns  ≈ ~420 µs upper bound
+       ≈ 25 steps  +  60_000 × 6.4 ns  ≈ ~390 µs upper bound
 ```
 
 The formula bounds *work*. Go's GC and scheduler still add tail jitter (sub-millisecond typical) that sits on top and is **not** bounded by the library — the guarantee is "this query will touch at most K rows", not "this query finishes within T wall-clock".
 
 `ErrScanBudget` means **"refused fast, fall back"**: on a hard-deadline path, treat it as "too expensive in this layer" and fall back to the primary store or a degraded answer rather than retrying. The counts behind a refusal (candidate rows, delta rows, budget) are not wrapped into the error — so the refusal path stays allocation-free — but the refusal count is exposed as `Stats().ScanBudgetRefusals`.
 
-Example config bounding worst-case scan work to ~420 µs (10k query budget
-+ 50k delta cap, at the measured ~7 ns/row; tighten `MaxDeltaRows` if your
+Example config bounding worst-case scan work to ~390 µs (10k query budget
++ 50k delta cap, at the measured ~6.4 ns/row; tighten `MaxDeltaRows` if your
 deadline needs a lower ceiling — the delta term usually dominates):
 
 ```go
@@ -287,23 +301,29 @@ Measured on an Intel Core i9-9880H (2.30GHz), `go test -bench . -benchmem -run x
 
 | Benchmark | Time/op | Bytes/op | Allocs/op |
 |-----------|---------|----------|-----------|
-| `BenchmarkQueryIndexed1M` (1M rows, 2 filter groups) | ~500 ns/op | 0 B/op | 0 allocs/op |
-| `BenchmarkQueryFullScan1M` (1M rows, 1 group on a non-index dim) | ~7.2 ms/op | 0 B/op | 0 allocs/op |
-| `BenchmarkQueryMultiGroup1M` (1M rows, 8 indexed groups unioned) | ~2.3 µs/op | 0 B/op | 0 allocs/op |
-| `BenchmarkQueryWithDelta1M` (1M base + 10k delta, 2 indexed groups) | ~67 µs/op | 0 B/op | 0 allocs/op |
-| `BenchmarkQueryAggsIndexed1M` (as the indexed query, 4 aggregate columns) | ~0.9 µs/op | 0 B/op | 0 allocs/op |
-| `BenchmarkGroupByIndexed1M` (~20k-row indexed range grouped by an 8-value dim, reused `GroupedResult`) | ~1.1 ms/op | ~89 B/op | 10 allocs/op |
-| `BenchmarkQueryAggsDistinct1M` (~20k-row indexed range, COUNT(DISTINCT publisher) + sum) | ~0.6 ms/op | 4 KB/op (one ~30k-bit bitmap) | 1 alloc/op |
-| `BenchmarkQueryRangeFilter1M` (~20k-row indexed range + numeric range condition) | ~0.4 ms/op | 0 B/op | 0 allocs/op |
-| `BenchmarkApply1K` (1000-record batch onto 1M rows) | ~4.5 ms/op averaged as the resident delta approaches the 50k compaction threshold (Apply copies the delta columns; the tuple index is map-cloned, not rebuilt) | ~3.8 MB/op | ~1.1k allocs/op |
-| `BenchmarkApplySmallOnLargeDelta` (10-record batch onto a ~100k-row delta) | ~2.4 ms/op (the O(DeltaRows) column copy dominates) | ~8.9 MB/op | ~283 allocs/op |
-| `BenchmarkReplaceAll1M` (full reconcile build, 1M records) | ~570 ms/op | ~202 MB/op | ~490 allocs/op |
-| `BenchmarkSaveSnapshot1M` (1M rows) | ~180 ms/op | ~1 MB/op | 15 allocs/op |
-| `BenchmarkLoadSnapshot1M` (1M rows, fresh `Store` per iteration) | ~56 ms/op | ~119 MB/op | ~32.7k allocs/op |
-| `BenchmarkCompact1M` (1M base + 1k delta merged per iteration, with dictionary compaction, `-benchtime=5x`) | ~88 ms/op | ~67 MB/op | ~427 allocs/op |
-| `BenchmarkCompactIDStable1M` (as above on the gated id-stable path, `DictCompactInterval` open) | ~50 ms/op | ~60 MB/op | ~34 allocs/op |
+| `BenchmarkQueryIndexed1M` (1M rows, 2 filter groups) | ~470 ns/op | 0 B/op | 0 allocs/op |
+| `BenchmarkQuerySmallIn1M` (indexed prefix + 3-value IN on a non-index dim, linear `matchOneIn`) | ~324 µs/op | 0 B/op | 0 allocs/op |
+| `BenchmarkQueryLargeIn1M` (indexed prefix + 1024-value IN on a non-index dim, binary-search `matchOneIn`) | ~1.05 ms/op | ~84 B/op | 0 allocs/op |
+| `BenchmarkQueryIndexInExpansion1M` (1M rows, 16-value IN on the first index dim, expanded into key intervals) | ~4.5 ms/op | ~0.3 KB/op | 0 allocs/op |
+| `BenchmarkQueryMultiGroupInExpansion1M` (2 groups x 10-value index-dim IN each, pooled routing avoids stack starvation) | ~7.5 ms/op | ~0.5 KB/op | 0 allocs/op |
+| `BenchmarkQueryFullScan1M` (1M rows, 1 group on a non-index dim) | ~6.4 ms/op | 0 B/op | 0 allocs/op |
+| `BenchmarkQueryMultiGroup1M` (1M rows, 8 indexed groups unioned) | ~2.1 µs/op | 0 B/op | 0 allocs/op |
+| `BenchmarkQueryWithDelta1M` (1M base + 10k delta, 2 indexed groups) | ~79 µs/op | 0 B/op | 0 allocs/op |
+| `BenchmarkQueryAggsIndexed1M` (as the indexed query, 4 aggregate columns) | ~0.86 µs/op | 0 B/op | 0 allocs/op |
+| `BenchmarkGroupByIndexed1M` (~20k-row indexed range grouped by an 8-value dim, reused `GroupedResult`) | ~0.95 ms/op | ~89 B/op | 10 allocs/op |
+| `BenchmarkQueryAggsDistinct1M` (~20k-row indexed range, COUNT(DISTINCT publisher) + sum) | ~0.45 ms/op | 4 KB/op (one ~30k-bit bitmap) | 1 alloc/op |
+| `BenchmarkQueryRangeFilter1M` (~20k-row indexed range + numeric range condition) | ~0.36 ms/op | 0 B/op | 0 allocs/op |
+| `BenchmarkApply1K` (1000-record batch onto 1M rows) | ~11 ms/op averaged as the resident delta approaches the 50k compaction threshold (Apply copies the delta columns; the tuple index is map-cloned, not rebuilt) — median of 5 runs, ranged ~7-11 ms/op, see note below | ~3.8 MB/op | ~1.1k allocs/op |
+| `BenchmarkApplySmallOnLargeDelta` (10-record batch onto a ~100k-row delta) | ~1.9 ms/op (the O(DeltaRows) column copy dominates) | ~8.9 MB/op | ~283 allocs/op |
+| `BenchmarkReplaceAll1M` (full reconcile build, 1M records, `-count=3` median — see note below) | ~481 ms/op | ~202 MB/op | ~488 allocs/op |
+| `BenchmarkSaveSnapshot1M` (1M rows) | ~134 ms/op | ~1 MB/op | 15 allocs/op |
+| `BenchmarkLoadSnapshot1M` (1M rows, fresh `Store` per iteration) | ~47 ms/op | ~119 MB/op | ~32.7k allocs/op |
+| `BenchmarkCompact1M` (1M base + 1k delta merged per iteration, with dictionary compaction) | ~71 ms/op | ~67 MB/op | ~425 allocs/op |
+| `BenchmarkCompactIDStable1M` (as above on the gated id-stable path, `DictCompactInterval` open) | ~43 ms/op | ~60 MB/op | ~34 allocs/op |
 
-`BenchmarkQueryFullScan1M` shows the degraded full-scan path costs roughly 14,000x an indexed lookup (~7.2 ms vs ~500 ns); `BenchmarkQueryWithDelta1M` shows a 10k-row delta overlay adds ~130x over the delta-free indexed query (~67 µs vs ~500 ns) from its linear scan. Queries against views with no expirable rows skip all per-row expiry checks (and the clock sample), so tables that never set `ExpireAt` pay nothing for the per-record TTL feature. Base rows are also exempt from per-row checks while the earliest base expiry is still in the future — the expire column is only touched once a row could actually be expired.
+`BenchmarkQueryFullScan1M` shows the degraded full-scan path costs roughly 13,600x an indexed lookup (~6.4 ms vs ~470 ns); `BenchmarkQueryWithDelta1M` shows a 10k-row delta overlay adds ~167x over the delta-free indexed query (~79 µs vs ~470 ns) from its linear scan. `BenchmarkQueryIndexInExpansion1M` shows index-dim IN expansion visiting only the matching sources' rows instead of the full table (~4.5 ms vs full-scan's ~6.4 ms for a set covering under a third of the dimension's cardinality); `BenchmarkQueryMultiGroupInExpansion1M` shows the pooled-routing starvation guard (see [docs/design-rationale.md](docs/design-rationale.md#lifting-the-query-shape-limits)) keeping a 2-group expansion cheap rather than degrading to a full scan. Queries against views with no expirable rows skip all per-row expiry checks (and the clock sample), so tables that never set `ExpireAt` pay nothing for the per-record TTL feature. Base rows are also exempt from per-row checks while the earliest base expiry is still in the future — the expire column is only touched once a row could actually be expired.
+
+`BenchmarkApply1K` is markedly slower than an earlier measurement of this table (previously ~4.5 ms). This predates the query-shape work above — it reproduces at a comparable magnitude on `feature/typed-dims-range` (the branch this one stacks on, which added `DimInt`/int64 dictionaries) — so it is not introduced by lifting the query-shape limits, which touches only the read path. The number is also noisy in this session, ranging ~7-11 ms/op across 5 runs (median ~11 ms, used above); not investigated further since the root cause sits outside this change's scope. `BenchmarkReplaceAll1M`, by contrast, is a measurement artifact worth flagging rather than a regression: a default single-count run calibrates it to one iteration (`b.N=1`, no in-run averaging), which measured ~1.85 s/op — but `-count=3` recalibrates it to 2-3 iterations and settles at ~481 ms/op, in line with the ~570 ms baseline; the table above uses the corrected, multi-iteration number.
 
 `TestCapacity5M` (5M rows, `go test -run TestCapacity5M -v`):
 
@@ -311,9 +331,9 @@ Measured on an Intel Core i9-9880H (2.30GHz), `go test -bench . -benchmem -run x
 |--------|----------|--------|
 | Resident memory (heap growth) | ~290 MB (incl. the per-record expiry column, ~8 B/row) | < 400 MB |
 | Heap objects growth | ~32,180 (tracks the ~30k publisher cardinality, not row count) | < 1,000,000 |
-| Full build (`ReplaceAll`, 5M rows) | ~3.8 s | informational |
-| Compact (5M base + 50k delta merge, incl. dictionary compaction) | ~450 ms | < 2 s |
-| Indexed query | ~500-720 ns/op | <= 5 µs |
+| Full build (`ReplaceAll`, 5M rows) | ~3.3 s | informational |
+| Compact (5M base + 50k delta merge, incl. dictionary compaction) | ~340 ms | < 2 s |
+| Indexed query | ~700-830 ns/op | <= 5 µs |
 
 ### Design Note
 

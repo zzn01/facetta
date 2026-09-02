@@ -174,12 +174,15 @@ constraint, which drove four decisions:
   NaN — float64's stand-in for SQL NULL. Any numeric sentinel (0, ±Inf) is a
   legal data value; an extra "valid" flag would change the output shape. The
   oracle produces the same NaN, and equivalence tests compare NaN-aware.
-- **IN filters, it does not plan.** IN conditions participate in row matching
-  but not in index-prefix planning: expanding a prefix dim's IN values into
-  multiple candidate ranges multiplies interval bookkeeping for a capability
-  the group-union API already expresses (one group per value). A group whose
-  leading dims carry only INs degrades to a scan and lands in the existing
-  `MaxScanRows` safety net.
+- **IN originally filtered only; that was later revisited.** The interval
+  bookkeeping concern was real at the time: a per-plan array sized for
+  expansion would have grown every query's scratch whether or not any query
+  actually used it. The limitation stood until the query-shape limits
+  themselves were lifted (see "Lifting the query-shape limits" below) — once
+  scratch moved to input-sized stack/pool arrays instead of one fixed
+  per-plan array, IN conditions on index-prefix dims could expand into key
+  intervals without taxing the equality-only path, and the one-group-per-value
+  workaround this bullet used to recommend stopped being necessary.
 - **Distinct counting is exact, not sketched.** `COUNT(DISTINCT dim)` is
   normally where engines reach for HyperLogLog, trading error bounds for
   memory. Here dictionary encoding already collapsed the value space: the
@@ -231,6 +234,105 @@ constraint, which drove four decisions:
   anyway — one code path that always works beats two paths where one only
   sometimes applies. Output is sorted by key strings so results are
   deterministic; keys alias the immutable dictionaries rather than copying.
+
+## Lifting the query-shape limits
+
+The original fixed per-plan arrays (16 groups, a handful of conditions per
+group, and so on) were sized generously for the request path's real shapes,
+but they were also a caller-visible ceiling: a caller whose filter list grew
+past the array size got a hard error instead of a slower answer, which is the
+wrong trade for a library whose whole pitch is "fast when it fits, safe
+otherwise" — `Config.MaxScanRows` already exists to make "slower" a bounded,
+refusable cost, so a silent hard cap on shape was duplicating that job worse.
+Every shape limit — group count, condition count, IN count and value count,
+range count, aggregate columns — was lifted, and `MaxScanRows` became the
+only caller-facing guard left.
+
+Lifting the limits without giving up the zero-allocation hot path meant
+splitting the per-query scratch into two sources instead of one fixed array.
+A shape that fits inside stack capacities (`scratchBack`, sized from the same
+constants the arrays used to be fixed at) runs entirely on the caller's own
+stack frame, with no `queryScratch` pointer ever escaping it; anything larger
+borrows a scratch from a `sync.Pool`, pre-sized exactly from the shape's own
+*input* counts (group count, condition count, resolved IN value count, and so
+on) rather than from table contents — so a given query shape always routes
+the same way regardless of how much data currently matches it. Routing is
+therefore a pure function of the call, not of the world, which keeps it easy
+to reason about and to test. A pooled scratch that comes back holding more
+than 1MB of capacity is dropped instead of returned to the pool: one
+pathological shape should cost one oversized allocation, not pin a large
+block for every unrelated query that later draws the same pool slot.
+
+Two follow-on optimizations paid for themselves inside that same budget.
+First, each IN condition's candidate window is sorted once at plan time;
+matching a row against a small window (16 ids or fewer) still scans it
+linearly (branchy linear scan beats a binary search's pointer-chasing at that
+size on real hardware), but a larger window binary-searches instead, turning
+per-row membership from O(n) into O(log n). Second, an IN condition on a
+leading index dimension now joins index-prefix planning instead of only
+filtering rows after the fact: the planner expands it into one candidate key
+interval per resolved id — a cartesian product across dims when several
+index-prefix dims each carry an IN — walked by an odometer over the covered
+prefix. Expansion is budgeted, not unconditional: extending the prefix by one
+more IN dimension is only taken while the combination count times
+⌈log₂ rows⌉ stays under a full scan's row count. That crossover is an
+optimistic cost *model*, not a hard limit — it assumes uniform cost per
+candidate and per row, and it says nothing on its own about how many
+candidates a query may probe before the model's own bookkeeping becomes the
+expensive part. What actually bounds worst-case planning work is a hard
+capacity: the pooled scratch reserves a fixed 4096-interval allowance for
+expansion (on top of its one-per-group floor), and expansion simply stops —
+falling back to a plain scan, exactly like an uncovered prefix always did —
+once it would need more slots than that, whatever the cost model estimated.
+
+Multi-group queries where several groups each carry an index-dim IN exposed a
+narrower version of the same scarcity on the stack path, whose interval
+budget is deliberately much smaller: an earlier group's expansion could
+consume most of it, degrading a later group to a full scan and wasting the
+earlier group's own expansion in the process — the union sweep ends up
+visiting close to the whole table regardless of how selective the first
+group's IN was. Rather than re-deriving the planner's own combination
+accounting just to route the query more precisely, the routing check is
+deliberately pessimistic: any IN-carrying shape whose group count plus total
+IN value count already exceeds the stack's whole interval budget goes
+straight to the pool, whose much larger allowance comfortably serves it.
+Measured on a two-group, ten-value-IN-each shape, this is roughly 2.9x faster
+than leaving it to starve on the stack; the extra pool round trip it costs
+shapes that never needed rerouting is unmeasurable next to those queries' own
+cost.
+
+`Cond.Range` deliberately did not follow IN onto the index-prefix path. Index
+keys are packed from dictionary ids, and dictionary ids are assigned in
+first-appearance order, not by value — two ids being numerically adjacent
+says nothing about their underlying integers being adjacent. A range
+condition therefore cannot be turned into a contiguous slice of the
+key-sorted base the way an equality or IN match can; it stays a per-row
+filter, same as it always was — two integer comparisons, still zero
+allocation.
+
+One Go implementation constraint surfaced repeatedly enough in this work to
+name, because it will otherwise tempt a future "cleanup": escape analysis
+treats two shapes as unconditionally heap-escaping, with no way to prove
+otherwise by restructuring, inlining, or swapping a slice for an array.
+First, a function returning a pointer that aliases a field of its own
+receiver forces the receiver itself onto the heap, even when the returned
+pointer never escapes the caller — the value has to be returned *by value*
+and have its address taken in the *caller's* own stack frame instead.
+Second, storing an actual slice (a pointer under the hood) into a struct
+field that lives inside an indexed slice element — `qs.plans[i].someSlice =
+x`, where `qs.plans` is itself a slice — marks that whole write path as
+escaping, regardless of whether the slice being stored is freshly re-sliced
+pool data that never outlives the call. Storing a plain `(offset, count
+int32)` pair into that same field does not trigger this; only pointer-shaped
+values do. This is why `groupPlan`, `inWindow` and the rest of the per-query
+scratch hold offset+count views into shared pools instead of sub-slices —
+not a style preference, but the one shape that keeps the whole per-query
+workspace on the stack for the fast path. Replacing those offset+count pairs
+with `[]int32`/`[]inWindow`/`[]rangeWindow` fields would silently move every
+query — including ones that never touch an IN condition or expansion — onto
+the heap; `TestQueryZeroAlloc` is the tripwire that would catch it, but the
+CAUTION comment on `queryScratch` (scratch.go) exists so nobody has to
+rediscover this the hard way first.
 
 ## Time-gated dictionary compaction
 
