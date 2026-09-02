@@ -348,15 +348,21 @@ func BenchmarkQueryWithDelta1M(b *testing.B) {
 
 // BenchmarkApply1K measures the cost of Apply-ing a 1000-record batch onto a
 // 1M-row store. Batches are pre-generated (varied per iteration so dedupe
-// doesn't collapse them) outside the timer. Apply deep-copies the delta on
-// every call, so the delta is periodically folded back in with a Compact
-// (timer stopped) to keep it from growing unboundedly across iterations.
+// doesn't collapse them) outside the timer: buildRows is deterministic, so
+// one generation of the full range sliced into windows yields the same
+// batches as regenerating per iteration did, without the O(b.N²) setup that
+// used to make high iteration counts run away for minutes. Apply deep-copies
+// the delta on every call, so the delta is periodically folded back in with
+// a Compact (timer stopped) to keep it from growing unboundedly across
+// iterations; the reported ns/op therefore depends on where b.N lands in the
+// delta-growth cycle — compare runs only at a fixed -benchtime=Nx.
 func BenchmarkApply1K(b *testing.B) {
 	s := benchStore(b, 1_000_000)
 	const batchRows = 1000
+	all := buildRows(batchRows * (b.N + 1))
 	batches := make([][]Record, b.N)
 	for i := range batches {
-		batches[i] = buildRows(batchRows * (i + 2))[batchRows*(i+1) : batchRows*(i+2)]
+		batches[i] = all[batchRows*(i+1) : batchRows*(i+2)]
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
