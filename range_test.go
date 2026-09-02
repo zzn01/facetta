@@ -172,28 +172,38 @@ func TestCondRangeErrors(t *testing.T) {
 	if _, err := s.Query(nil, []Cond{{Dim: "nope", Range: r}}); err == nil {
 		t.Fatal("range on unknown dim accepted")
 	}
-	group := make([]Cond, 0, maxRanges+1)
-	for i := 0; i <= maxRanges; i++ {
-		group = append(group, Cond{Dim: "country", Range: r})
+	// Ranges have no count limit: 17 identical conditions in one group
+	// (previously rejected past 16) must now succeed as a harmless
+	// redundant AND, matching the same rows as a single condition would.
+	many := make([]Cond, 0, 17)
+	for i := 0; i < 17; i++ {
+		many = append(many, Cond{Dim: "country", Range: &Range{Min: 0, Max: 100}})
 	}
-	if _, err := s.Query(nil, group); err == nil {
-		t.Fatal("too many ranges accepted")
+	got, err := s.Query(nil, many)
+	if err != nil {
+		t.Fatal(err)
 	}
+	assertSame(t, got, []float64{60, 3}) // country in [0,100]: rows with 10,25,90 (150 excluded)
 
-	// maxRanges is a per-QUERY total, not per-group: 9 ranges in one group
-	// plus 8 in another (17 total, neither group alone over the limit) must
-	// still be rejected.
+	// Ranges are also unbounded per query, not just per group: 9 ranges in
+	// one group plus 8 in another (17 total) must succeed via the pooled
+	// path and produce the correct union result.
 	g1 := make([]Cond, 0, 9)
 	for i := 0; i < 9; i++ {
-		g1 = append(g1, Cond{Dim: "country", Range: r})
+		g1 = append(g1, Cond{Dim: "country", Range: &Range{Min: 0, Max: 20}}) // country=10
 	}
 	g2 := make([]Cond, 0, 8)
 	for i := 0; i < 8; i++ {
-		g2 = append(g2, Cond{Dim: "country", Range: r})
+		g2 = append(g2, Cond{Dim: "country", Range: &Range{Min: 80, Max: 100}}) // country=90
 	}
-	if _, err := s.Query(nil, g1, g2); !errors.Is(err, errTooManyRanges) {
-		t.Fatalf("17 ranges split 9+8 across two groups: err = %v, want errTooManyRanges", err)
+	if measureShape([][]Cond{g1, g2}, 0).fits() {
+		t.Fatal("17 ranges across two groups must route to the pooled scratch")
 	}
+	got, err = s.Query(nil, g1, g2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSame(t, got, []float64{40, 2}) // country=10 row + country=90 row
 }
 
 func TestCondRangeAggsAndGroupBy(t *testing.T) {

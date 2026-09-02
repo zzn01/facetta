@@ -25,9 +25,7 @@ type Agg struct {
 	Op     AggOp
 }
 
-const maxAggs = 16
-
-var errBadAggCount = errors.New("facetta: need 1..16 aggregates")
+var errBadAggCount = errors.New("facetta: need at least one aggregate")
 
 // resolveAggs validates aggs and appends each column's metric index (-1 for
 // AggCount/AggDistinct) to qs.mets and its distinct-dim index (-1 for
@@ -36,7 +34,7 @@ var errBadAggCount = errors.New("facetta: need 1..16 aggregates")
 // appends (written as manual reslice-then-set, not `append` — see the
 // CAUTION on queryScratch) never reallocate.
 func (s *Store) resolveAggs(aggs []Agg, qs *queryScratch) error {
-	if len(aggs) == 0 || len(aggs) > maxAggs {
+	if len(aggs) == 0 {
 		return errBadAggCount
 	}
 	for _, a := range aggs {

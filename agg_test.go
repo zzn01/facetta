@@ -1,6 +1,7 @@
 package facetta
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
 	"testing"
@@ -119,9 +120,20 @@ func TestQueryAggsErrors(t *testing.T) {
 	if _, err := s.QueryAggs(nil, nil, all); err == nil {
 		t.Fatal("zero aggs accepted")
 	}
-	big := make([]Agg, maxAggs+1)
-	if _, err := s.QueryAggs(nil, big, all); err == nil {
-		t.Fatal("too many aggs accepted")
+	// Aggregate columns have no count limit: 20 (previously rejected past
+	// 16) must now succeed via the pooled path, each computing the same sum.
+	big := make([]Agg, 20)
+	for i := range big {
+		big[i] = Agg{Metric: "visits", Op: AggSum}
+	}
+	gotBig, err := s.QueryAggs(nil, big, all)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, v := range gotBig {
+		if v != 100 { // sum of visits over all 4 base rows: 10+20+30+40
+			t.Fatalf("agg col %d: got %v want 100", i, v)
+		}
 	}
 	if _, err := s.QueryAggs(nil, []Agg{{Metric: "nope", Op: AggSum}}, all); err == nil {
 		t.Fatal("unknown metric accepted")
@@ -198,13 +210,22 @@ func TestCondInErrors(t *testing.T) {
 	if _, err := s.Query(nil, []Cond{{Dim: "os", Value: "ios", In: []string{"android"}}}); err == nil {
 		t.Fatal("Value and In together accepted")
 	}
-	big := make([]string, maxInVals+1)
+	// IN lists have no count limit: 200 values (previously rejected past
+	// 16) must now succeed via the pooled path, matching every "ios" row
+	// and dropping the rest as unknown values.
+	big := make([]string, 200)
 	for i := range big {
-		big[i] = "v"
+		if i%2 == 0 {
+			big[i] = "ios"
+		} else {
+			big[i] = fmt.Sprintf("nope%d", i)
+		}
 	}
-	if _, err := s.Query(nil, []Cond{{Dim: "os", In: big}}); err == nil {
-		t.Fatal("too many In values accepted")
+	got, err := s.Query(nil, []Cond{{Dim: "os", In: big}})
+	if err != nil {
+		t.Fatal(err)
 	}
+	assertSame(t, got, []float64{80, 9}) // ios rows: visits 10+30+40, revenue 1.5+3.5+4.0
 }
 
 func TestQueryAggsZeroAlloc(t *testing.T) {

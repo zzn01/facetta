@@ -15,15 +15,16 @@ type Cond struct {
 	// contribute to index-prefix planning: a group whose leading index dims
 	// carry only IN conditions degrades to a full scan (guarded by
 	// Config.MaxScanRows). For indexed multi-value queries use one group per
-	// value instead. At most 16 values per condition, 16 IN conditions and
-	// 128 resolved values per query.
+	// value instead. In has no count limit; values absent from the table are
+	// simply dropped from the set. Queries are guarded only by
+	// Config.MaxScanRows.
 	In []string
 	// Range, when non-nil, matches rows whose Dim value (an int64 — see
 	// DimInt: identity on such dims IS the integer) falls within
 	// [Min, Max] (inclusive; use math.MinInt64/MaxInt64 for open ends).
 	// Mutually exclusive with Value and In. Like In, Range filters rows but
-	// does not join index-prefix planning. At most 16 range conditions per
-	// query.
+	// does not join index-prefix planning. Range has no count limit either;
+	// queries are guarded only by Config.MaxScanRows.
 	Range *Range
 }
 
@@ -31,18 +32,9 @@ type Cond struct {
 type Range struct{ Min, Max int64 }
 
 var (
-	errBadGroupCount     = errors.New("facetta: need 1..16 filter groups")
-	errTooManyConds      = errors.New("facetta: too many conditions in group")
+	errBadGroupCount     = errors.New("facetta: need at least one filter group")
 	errCondValueAndIn    = errors.New("facetta: Cond.Value and Cond.In are mutually exclusive")
-	errTooManyInValues   = errors.New("facetta: too many IN values in query")
 	errCondRangeConflict = errors.New("facetta: Cond.Range is mutually exclusive with Value and In")
-	errTooManyRanges     = errors.New("facetta: too many range conditions in query")
-)
-
-const (
-	maxInConds = 16  // total IN conditions per query
-	maxInIDs   = 128 // total resolved IN values per query
-	maxRanges  = 16  // total range conditions per query
 )
 
 // groupPlan is one OR-group's resolved plan. condOff/condN, insOff/insN and
@@ -69,9 +61,6 @@ type groupPlan struct {
 // (see the comment on groupPlan for why not sub-slices).
 func (v *view) plan(sc *Schema, g []Cond, p *groupPlan, qs *queryScratch) error {
 	*p = groupPlan{basePossible: true}
-	if len(g) > maxConds {
-		return errTooManyConds
-	}
 	if len(g) == 0 {
 		p.scan = true // empty group matches every row
 		return nil
@@ -91,9 +80,6 @@ func (v *view) plan(sc *Schema, g []Cond, p *groupPlan, qs *queryScratch) error 
 			if !sc.isInt(di) {
 				return fmt.Errorf("facetta: dimension %q is not DimInt", c.Dim)
 			}
-			if len(qs.rWins) == maxRanges {
-				return errTooManyRanges
-			}
 			qs.rWins = qs.rWins[:len(qs.rWins)+1]
 			qs.rWins[len(qs.rWins)-1] = rangeWindow{dim: int32(di), min: c.Range.Min, max: c.Range.Max}
 			continue
@@ -101,9 +87,6 @@ func (v *view) plan(sc *Schema, g []Cond, p *groupPlan, qs *queryScratch) error 
 		if len(c.In) > 0 {
 			if c.Value != "" {
 				return errCondValueAndIn
-			}
-			if len(c.In) > maxInVals || len(qs.inWins) == maxInConds {
-				return errTooManyInValues
 			}
 			off := len(qs.inPool)
 			anyBase := false
@@ -121,9 +104,6 @@ func (v *view) plan(sc *Schema, g []Cond, p *groupPlan, qs *queryScratch) error 
 				}
 				if !ok {
 					continue // value nowhere in the table: drop from the set
-				}
-				if len(qs.inPool) == maxInIDs {
-					return errTooManyInValues
 				}
 				qs.inPool = qs.inPool[:len(qs.inPool)+1]
 				qs.inPool[len(qs.inPool)-1] = id
@@ -294,7 +274,7 @@ type iv struct{ lo, hi int }
 // routing before this is called — see the comment on scratchBack), so every
 // query entry point (QueryGroups, QueryAggs, QueryGroupBy) shares one planner.
 func (s *Store) planGroups(v *view, groups [][]Cond, qs *queryScratch) (int, error) {
-	if len(groups) == 0 || len(groups) > maxGroups {
+	if len(groups) == 0 {
 		return 0, errBadGroupCount
 	}
 	sc := &s.sc
@@ -322,9 +302,10 @@ func (s *Store) planGroups(v *view, groups [][]Cond, qs *queryScratch) (int, err
 			qs.ivs[len(qs.ivs)-1] = iv{lo, hi}
 		}
 	}
-	// insertion sort by lo (n is small, bounded by fastGroups/maxGroups):
+	// insertion sort by lo (n == len(groups): small in the common case,
+	// still O(n^2) worst case for pathologically large group counts):
 	// measured cheaper than slices.SortFunc, whose generic pdqsort machinery
-	// and closure call overhead dominate at this size.
+	// and closure call overhead dominate at typical sizes.
 	n := len(qs.ivs)
 	for i := 1; i < n; i++ {
 		for j := i; j > 0 && qs.ivs[j].lo < qs.ivs[j-1].lo; j-- {

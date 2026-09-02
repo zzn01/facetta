@@ -39,7 +39,16 @@ func TestEquivalenceRandomized(t *testing.T) {
 			card := 4 // low cardinality to force collisions and overlaps
 
 			randGroups := func() [][]Cond {
+				// ~1 in 8 shapes is "big": many groups and/or long IN lists,
+				// well past the old 16-group/16-value limits and often past
+				// the stack fast path, to exercise the pooled scratch under
+				// the same randomized equivalence checks. Small shapes stay
+				// dominant so the fast path remains the main workload.
+				big := rng.Intn(8) == 0
 				ng := 1 + rng.Intn(3)
+				if big {
+					ng = 1 + rng.Intn(40)
+				}
 				groups := make([][]Cond, ng)
 				for g := range groups {
 					nc := rng.Intn(4)
@@ -62,8 +71,13 @@ func TestEquivalenceRandomized(t *testing.T) {
 						}
 						switch {
 						case rng.Intn(4) == 0:
-							// ~1 in 4 conditions is an IN set of 1-3 values
-							in := make([]string, 1+rng.Intn(3))
+							// ~1 in 4 conditions is an IN set of 1-3 values,
+							// or 1-40 for a big shape.
+							inN := 1 + rng.Intn(3)
+							if big {
+								inN = 1 + rng.Intn(40)
+							}
+							in := make([]string, inN)
 							for i := range in {
 								in[i] = val()
 							}
@@ -81,7 +95,11 @@ func TestEquivalenceRandomized(t *testing.T) {
 				return groups
 			}
 			randAggs := func() []Agg {
-				aggs := make([]Agg, 1+rng.Intn(4))
+				n := 1 + rng.Intn(4)
+				if rng.Intn(8) == 0 {
+					n = 1 + rng.Intn(24) // occasionally past the old 16-column limit
+				}
+				aggs := make([]Agg, n)
 				for i := range aggs {
 					op := AggOp(rng.Intn(int(AggDistinct) + 1))
 					a := Agg{Op: op}

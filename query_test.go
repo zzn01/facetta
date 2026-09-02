@@ -1,7 +1,9 @@
 package facetta
 
 import (
+	"fmt"
 	"math/rand"
+	"runtime/debug"
 	"testing"
 )
 
@@ -74,10 +76,6 @@ func TestQueryErrors(t *testing.T) {
 	}
 	if _, err := s.Query(nil, []Cond{{Dim: "nope", Value: "x"}}); err == nil {
 		t.Fatal("unknown dimension accepted")
-	}
-	big := make([][]Cond, maxGroups+1)
-	if _, err := s.QueryGroups(nil, big); err == nil {
-		t.Fatal("too many groups accepted")
 	}
 }
 
@@ -229,5 +227,129 @@ func TestQueryPooledScratchPath(t *testing.T) {
 			t.Fatalf("run %d: QueryAggs: %v", i, err)
 		}
 		assertSameNaN(t, gotAggs, []float64{4, 100, 1, 2})
+	}
+}
+
+// TestQueryUnboundedShapes exercises shapes beyond the old 16/16/16/128
+// limits through the pooled scratch and checks exact sums against a
+// hand-computed expectation.
+func TestQueryUnboundedShapes(t *testing.T) {
+	sc := testSchema()
+	s, err := New(sc, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 64 distinct source values, 1 row each, metric = row index.
+	recs := make([]Record, 64)
+	for i := range recs {
+		recs[i] = rec(ts(100), []float64{float64(i), 0},
+			fmt.Sprintf("s%d", i), "a0", "p0", "c0", "o0")
+	}
+	if err := s.ReplaceAll(recs); err != nil {
+		t.Fatal(err)
+	}
+	// 40 OR groups (> old 16): sources 0..39, expected sum 0+1+...+39.
+	groups := make([][]Cond, 40)
+	for i := range groups {
+		groups[i] = []Cond{{Dim: "source", Value: fmt.Sprintf("s%d", i)}}
+	}
+	got, err := s.QueryGroups(nil, groups)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := float64(39 * 40 / 2); got[0] != want {
+		t.Fatalf("40 groups: got %v want %v", got[0], want)
+	}
+	// one IN with 200 values (> old 16 per cond and > 128 total).
+	in := make([]string, 200)
+	for i := range in {
+		in[i] = fmt.Sprintf("s%d", i) // 64 exist, 136 unknown (dropped)
+	}
+	got, err = s.QueryGroups(nil, [][]Cond{{{Dim: "source", In: in}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := float64(63 * 64 / 2); got[0] != want {
+		t.Fatalf("200-value IN: got %v want %v", got[0], want)
+	}
+	// 20 aggregate columns (> old 16).
+	aggs := make([]Agg, 20)
+	for i := range aggs {
+		aggs[i] = Agg{Op: AggCount}
+	}
+	adst, err := s.QueryAggs(nil, aggs, [][]Cond{{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adst[19] != 64 {
+		t.Fatalf("20 agg cols: got %v want 64", adst[19])
+	}
+}
+
+// TestQueryZeroAllocLarge: after a warm-up call populates the pool, an
+// over-capacity query must not allocate on the steady state (pool hit,
+// pre-sized slices, no growth). GC is disabled for the measurement window
+// so a background collection can't steal the pooled scratch mid-run.
+//
+// Under -race the bound is NOT loosened arbitrarily: it is derived from a
+// specific, documented Go runtime behavior, confirmed by direct
+// measurement rather than assumed. $GOROOT/src/sync/pool.go's Put has:
+//
+//	if race.Enabled {
+//		if runtime_randn(4) == 0 {
+//			// Randomly drop x on floor.
+//			return
+//		}
+//		...
+//	}
+//
+// i.e. under every -race build, sync.Pool.Put unconditionally discards
+// ~1/4 of items, by design, to widen race-detector coverage of the
+// fresh-vs-reused code paths — independent of GC, GOMAXPROCS or goroutine
+// scheduling. This was verified directly: with GC fully disabled
+// (debug.SetGCPercent(-1), confirmed via runtime.MemStats.NumGC delta ==
+// 0 across the run) and GOMAXPROCS(1) (ruling out cross-P pool-affinity
+// misses), a bare sync.Pool of a trivial struct in this same package still
+// showed ~52/200 fresh allocations under -race and exactly 1/200 without
+// it — matching the ~25% Put-drop rate, not a GC or scheduling artifact.
+// Rebuilding this test's evicted scratch costs 5 mallocs (1 struct + 4
+// grown slices: plans/ivs/condDims/condIDs, the only pools this shape's
+// 40 groups/40 conds/0 aggs actually needs), so steady state under -race
+// is expected to average ~0.25*5 = 1.25 allocs/op (measured 1.0-1.3
+// across repeated runs); a real pooling regression (e.g. release() never
+// actually returning the scratch) would show ~5/op even under -race,
+// still well past the threshold below.
+func TestQueryZeroAllocLarge(t *testing.T) {
+	sc := testSchema()
+	s, err := New(sc, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recs := []Record{rec(ts(100), []float64{1, 0}, "s0", "a0", "p0", "c0", "o0")}
+	if err := s.ReplaceAll(recs); err != nil {
+		t.Fatal(err)
+	}
+	groups := make([][]Cond, 40)
+	for i := range groups {
+		groups[i] = []Cond{{Dim: "source", Value: "s0"}}
+	}
+	var dst []float64
+	if _, err := s.QueryGroups(dst, groups); err != nil { // warm the pool
+		t.Fatal(err)
+	}
+	if _, err := s.QueryGroups(dst, groups); err != nil { // second warm-up: settle the pool item
+		t.Fatal(err)
+	}
+	old := debug.SetGCPercent(-1)
+	defer debug.SetGCPercent(old)
+	allocs := testing.AllocsPerRun(200, func() {
+		dst, _ = s.QueryGroups(dst, groups)
+	})
+	threshold := 0.5
+	if raceEnabled {
+		threshold = 3 // see the doc comment above: ~1.25 expected, real regressions read ~5
+	}
+	if allocs > threshold {
+		t.Fatalf("large query steady state allocates %.1f/op (threshold %.1f)", allocs, threshold)
 	}
 }
