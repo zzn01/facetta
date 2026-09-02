@@ -620,18 +620,16 @@ func (s *Store) QueryGroups(dst []float64, groups [][]Cond) ([]float64, error) {
 	} else {
 		pooled = getPooledScratch(sh)
 		qs = pooled
+		// Release only the pooled pointer, never &local (equivalently, never
+		// qs itself): a release call on a value that might be the
+		// stack-backed local forces local (and back) onto the heap, because
+		// release's body can reach sync.Pool.Put — see the CAUTION on
+		// queryScratch. Deferring inside this branch keeps the stack path
+		// free of it and returns the scratch on every exit, panics
+		// included; the open-coded defer is free on the measured hot path.
+		defer pooled.release()
 	}
-	out, err := s.queryGroups(dst, groups, qs)
-	// release only the pooled pointer, never &local (equivalently, never qs
-	// itself): calling release on a value that might be the stack-backed
-	// local forces local (and back) onto the heap, because release's body
-	// can reach sync.Pool.Put — see the CAUTION on queryScratch. release is
-	// a no-op for stack scratches anyway, so skipping it here changes
-	// nothing at runtime.
-	if pooled != nil {
-		pooled.release()
-	}
-	return out, err
+	return s.queryGroups(dst, groups, qs)
 }
 
 func (s *Store) queryGroups(dst []float64, groups [][]Cond, qs *queryScratch) ([]float64, error) {

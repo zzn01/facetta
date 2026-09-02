@@ -137,15 +137,11 @@ func (s *Store) QueryAggs(dst []float64, aggs []Agg, groups [][]Cond) ([]float64
 	} else {
 		pooled = getPooledScratch(sh)
 		qs = pooled
+		// Deferred release of the pooled pointer only, never &local: see the
+		// comment in QueryGroups.
+		defer pooled.release()
 	}
-	out, err := s.queryAggs(dst, aggs, groups, qs)
-	// release only the pooled pointer, never &local: see the comment in
-	// QueryGroups for why calling release on the stack value would defeat
-	// its zero-alloc guarantee.
-	if pooled != nil {
-		pooled.release()
-	}
-	return out, err
+	return s.queryAggs(dst, aggs, groups, qs)
 }
 
 func (s *Store) queryAggs(dst []float64, aggs []Agg, groups [][]Cond, qs *queryScratch) ([]float64, error) {
