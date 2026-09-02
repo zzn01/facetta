@@ -49,14 +49,15 @@ Three pillars:
 
 | File | Lines | Responsibility |
 |------|-----:|------|
-| `schema.go` | 161 | `Schema`/`Record`/`Config` definitions and validation, error sentinels, schema fingerprint |
+| `schema.go` | 167 | `Schema`/`Record`/`Config` definitions and validation, error sentinels, schema fingerprint |
 | `dict.go` | 103 | Value ↔ uint32 id dictionary: spelling-keyed for string dims, int64-keyed (no strings stored) for integer dims |
 | `snapshot.go` | 424 | Immutable columnar base; full build (`buildFromRecords`) and merge (`mergeView`/`zipMerge`) |
 | `view.go` | 227 | `view`/`delta` structures; write path `applyDelta` (copy-on-write) |
 | `store.go` | 193 | `Store` facade: atomic pointer, write lock, `Apply`/`Compact`/`ReplaceAll` |
-| `query.go` | 470 | `Cond` (equality/IN/range), shared planner (`planGroups`), `QueryGroups`, scan budget |
-| `agg.go` | 179 | `Agg`/`AggOp` aggregate selection, `QueryAggs` (zero-alloc) |
-| `groupby.go` | 226 | `QueryGroupBy` hash aggregation into a reusable `GroupedResult` |
+| `query.go` | 710 | `Cond` (equality/IN/range), shared planner (`planGroups`), `QueryGroups`, scan budget |
+| `scratch.go` | 376 | Per-query scratch: shape measurement and stack-vs-pool routing, dual sourcing (`scratchBack`/`sync.Pool`), pooled retention guard, the offset+count/escape-analysis CAUTION contract `groupPlan` and friends rely on |
+| `agg.go` | 265 | `Agg`/`AggOp` aggregate selection, `QueryAggs` (stack/pooled scratch, amortized zero-alloc; `AggDistinct` always allocates a bitmap) |
+| `groupby.go` | 288 | `QueryGroupBy` hash aggregation into a reusable `GroupedResult` |
 | `compactor.go` | 89 | Optional background compaction policy (when to call `Compact`) |
 | `persist.go` | 272 | Snapshot persistence/loading, versioned binary format + CRC |
 | `stats.go` | 70 | Monitoring counter snapshot |
@@ -131,9 +132,13 @@ view.Load()                          ── the only atomic read; everything aft
   │                                     · value only in extras → basePossible=false, skip base and scan only delta
   │                                     · no usable prefix → scan (full base scan, counted in Stats.FullScans)
   │
-  ├─ range union                     ── ≤16 ranges insertion-sorted by lo (stack array),
+  ├─ interval union                  ── base candidate intervals (qs.ivs) sorted by lo —
+  │                                     insertion sort up to 32 intervals, slices.SortFunc
+  │                                     above that (measured cheaper below the crossover) —
   │                                     deduplicated with a high-water mark `done`, overlapping
-  │                                     ranges scanned only once
+  │                                     intervals scanned only once. The interval count is no
+  │                                     longer tied to the group count: IN index expansion
+  │                                     (below) can emit several per group
   │
   ├─ scan budget (optional)          ── after planning, before touching any row, the number of rows
   │                                     to be visited is fully known: deduplicated base candidate
@@ -148,10 +153,19 @@ view.Load()                          ── the only atomic read; everything aft
   └─ linear scan of delta            ── same expiry skip + per-group matching
 ```
 
-**How zero heap allocation is achieved**: all scratch space (`plans`, `ivs`) consists of
-fixed-size stack arrays of `maxGroups`/`maxConds`; `dst` is reused by the caller; error
-sentinels are preallocated. `TestQueryZeroAlloc` is the tripwire — any hot-path change
-must keep it green.
+**How zero heap allocation is achieved**: every query first measures its own shape
+(`measureShape`, `scratch.go`) and routes to one of two scratch sources. A shape that fits
+stack capacities (16 groups / 32 equality conds / 16 IN conds / 128 IN values / 16 ranges /
+16 agg columns, plus a 16-interval floor for `ivs`) runs on `scratchBack`, declared as a
+local in the caller's own stack frame — no `queryScratch` pointer for it ever escapes.
+Anything larger borrows a scratch from a `sync.Pool`, pre-sized exactly from the shape's own
+*input* counts (so routing is deterministic regardless of table contents), plus a 4096-interval
+allowance when the shape carries any IN condition (headroom for index expansion, see below).
+A pooled scratch whose retained capacity exceeds 1MB on release is dropped instead of pooled,
+so one pathological query cannot pin a large block for every later query. `dst` is reused by
+the caller; error sentinels are preallocated. `TestQueryZeroAlloc` (stack path) and
+`TestQueryZeroAllocLarge` (pooled path, steady state) are the tripwires — any hot-path change
+must keep both green.
 
 **Expiry checks are also on demand**: when the view contains no expirable rows at all
 (`base.minExpire==0 && !delta.hasExpiry`), `now` is not even sampled and the expire
@@ -198,15 +212,33 @@ collapsing into one id trip the entry-count check), so snapshots written
 before the dim was declared DimInt are refused into the full-pull
 fallback.
 
-IN conditions (`Cond.In`) are resolved into a per-query id pool (`queryIns`)
-rather than into `groupPlan`, and checked by `matchIns` at the call sites
-rather than inside `matchBase`/`matchDelta`. Both placements are
-deliberate hot-path protection, measured before merging: a per-plan id array
-inflates the plans' stack scratch by an order of magnitude (all of which is
-zero-initialized on every query), and folding the IN check into the matchers
-pushes them past the compiler's inline budget — either costs double-digit
-percentages on the indexed query. IN-free queries pass a nil pool and pay
-one never-taken branch per matched row.
+IN conditions (`Cond.In`) resolve into the per-query scratch's `inWins`/`inPool` pools
+(`scratch.go`) rather than into `groupPlan` itself — `groupPlan` holds only an
+offset+count view into those pools, for the same escape-analysis reason spelled out in the
+CAUTION comment on `queryScratch`: storing an actual slice into a `groupPlan` held inside an
+indexed slice (`qs.plans`) would force the whole per-query scratch onto the heap,
+unconditionally, regardless of inlining. Each IN window's candidate ids are sorted ascending
+once at plan time; `matchIns`/`matchOneIn` (`query.go`) then probe linearly for windows of at
+most 16 ids and binary-search above that, turning per-row membership from O(n) into O(log n)
+on large windows. Both the pool-vs-`groupPlan` placement and the IN check's exclusion from
+`matchBase`/`matchDelta` are measured hot-path protections: folding the check into the
+matchers pushes them past the compiler's inline budget (measured ~20% regression on the
+indexed path), and keeping `matchIns` itself inlinable at its own call sites further requires
+splitting the linear/binary logic out into a `go:noinline` `matchOneIn` (see the comment on
+`matchIns` for the exact inline-budget arithmetic that forces this). IN-free queries pay one
+never-taken branch per matched row.
+
+An IN condition on a leading index dimension additionally joins index-prefix planning instead
+of only filtering rows: `planExpand` (`query.go`) expands it into one candidate key interval
+per resolved id — a cartesian product across dims when several index-prefix dims each carry
+an IN — emitted by an odometer over the covered prefix. Expansion is budgeted, not
+unconditional: extending the prefix by one more IN dimension is only taken while the
+combination count times ⌈log₂ rows⌉ stays under a full scan's row count, and while the shared
+interval sink still has room (the pooled path's 4096-interval allowance above; the stack
+path's floor leaves only whatever a group's reservation doesn't already owe later groups —
+see the comment on `fastIvs`, `scratch.go`, for why a shape combining several IN-carrying
+groups is routed to the pool instead of left to compete for those few slots). Either budget
+failing falls back to a full scan, exactly like an uncovered prefix always did.
 
 ## Write Path: Apply's Copy-on-Write (`view.go:113`)
 

@@ -11,12 +11,7 @@ import (
 	"time"
 )
 
-const (
-	maxDims   = 16
-	maxGroups = 16
-	maxConds  = 16
-	maxInVals = 16
-)
+const maxDims = 16
 
 var (
 	// ErrRowLimit is returned when a compaction would exceed Config.MaxRows;

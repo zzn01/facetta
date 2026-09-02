@@ -39,12 +39,32 @@ func TestEquivalenceRandomized(t *testing.T) {
 			card := 4 // low cardinality to force collisions and overlaps
 
 			randGroups := func() [][]Cond {
+				// ~1 in 8 shapes is "big": many groups and/or long IN lists,
+				// well past the old 16-group/16-value limits and often past
+				// the stack fast path, to exercise the pooled scratch under
+				// the same randomized equivalence checks. Small shapes stay
+				// dominant so the fast path remains the main workload.
+				big := rng.Intn(8) == 0
 				ng := 1 + rng.Intn(3)
+				if big {
+					ng = 1 + rng.Intn(40)
+				}
 				groups := make([][]Cond, ng)
 				for g := range groups {
 					nc := rng.Intn(4)
 					for range nc {
+						// Pick the condition kind BEFORE the dim so IN
+						// conditions can be biased onto the index prefix
+						// (dims 0..IndexDims-1), where the planner expands
+						// them into one key interval per candidate — and,
+						// with two such conds in one group, into a
+						// cartesian of intervals. Everything else is
+						// uniform over all dims as before.
+						kind := rng.Intn(4) // 0: IN, 1: maybe range, else equality
 						d := rng.Intn(len(sc.Dims))
+						if kind == 0 && rng.Intn(2) == 0 {
+							d = rng.Intn(sc.IndexDims)
+						}
 						val := func() string {
 							if sc.Dims[d].Name == "country" {
 								// numeric dim: random spelling of the same number
@@ -61,14 +81,19 @@ func TestEquivalenceRandomized(t *testing.T) {
 							return fmt.Sprintf("%s%d", sc.Dims[d].Name[:1], rng.Intn(card+1)) // sometimes absent
 						}
 						switch {
-						case rng.Intn(4) == 0:
-							// ~1 in 4 conditions is an IN set of 1-3 values
-							in := make([]string, 1+rng.Intn(3))
+						case kind == 0:
+							// ~1 in 4 conditions is an IN set of 1-3 values,
+							// or 1-40 for a big shape.
+							inN := 1 + rng.Intn(3)
+							if big {
+								inN = 1 + rng.Intn(40)
+							}
+							in := make([]string, inN)
 							for i := range in {
 								in[i] = val()
 							}
 							groups[g] = append(groups[g], Cond{Dim: sc.Dims[d].Name, In: in})
-						case rng.Intn(4) == 0 && sc.Dims[d].Name == "country":
+						case kind == 1 && sc.Dims[d].Name == "country":
 							// numeric dim: sometimes a range (possibly inverted -> empty)
 							lo := int64(rng.Intn(card + 2))
 							hi := int64(rng.Intn(card + 2))
@@ -81,7 +106,11 @@ func TestEquivalenceRandomized(t *testing.T) {
 				return groups
 			}
 			randAggs := func() []Agg {
-				aggs := make([]Agg, 1+rng.Intn(4))
+				n := 1 + rng.Intn(4)
+				if rng.Intn(8) == 0 {
+					n = 1 + rng.Intn(24) // occasionally past the old 16-column limit
+				}
+				aggs := make([]Agg, n)
 				for i := range aggs {
 					op := AggOp(rng.Intn(int(AggDistinct) + 1))
 					a := Agg{Op: op}
