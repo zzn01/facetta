@@ -30,8 +30,11 @@ const (
 
 // inWindow is one resolved IN condition: candidate dictionary ids live at
 // queryScratch.inPool[off : off+n] (which therefore must never reallocate
-// mid-plan). off/n are a pool offset+count rather than a materialized
-// []uint32 sub-slice deliberately: see the CAUTION on queryScratch for why.
+// mid-plan), sorted ascending by plan() right after the segment is filled —
+// matchIns binary-searches windows above its linear-scan threshold, and this
+// is also the precondition for IN index expansion. off/n are a pool
+// offset+count rather than a materialized []uint32 sub-slice deliberately:
+// see the CAUTION on queryScratch for why.
 type inWindow struct {
 	dim    int32
 	off, n int32

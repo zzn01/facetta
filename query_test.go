@@ -286,6 +286,44 @@ func TestQueryUnboundedShapes(t *testing.T) {
 	}
 }
 
+// TestLargeInMatchesEqualityUnion pins IN-condition semantics: a >16-value IN
+// condition (large enough to hit the binary-search path once matchIns grows
+// one) must match exactly the same rows, with the same total, as the
+// equivalent union of single-value equality groups — duplicate values in the
+// IN list included. This passes both before and after the sort+binary-search
+// rewrite; it's a regression tripwire for that rewrite, not evidence on its
+// own that the rewrite is correct.
+func TestLargeInMatchesEqualityUnion(t *testing.T) {
+	sc := testSchema()
+	s, err := New(sc, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recs := make([]Record, 64)
+	for i := range recs {
+		recs[i] = rec(ts(100), []float64{float64(i), 0},
+			fmt.Sprintf("s%d", i), "a0", "p0", "c0", "o0")
+	}
+	if err := s.ReplaceAll(recs); err != nil {
+		t.Fatal(err)
+	}
+	in := make([]string, 33) // > 16: binary path once implemented
+	groups := make([][]Cond, 33)
+	for i := range in {
+		in[i] = fmt.Sprintf("s%d", 2*i%64) // duplicates included: s0 appears twice
+		groups[i] = []Cond{{Dim: "source", Value: in[i]}}
+	}
+	a, err := s.QueryGroups(nil, [][]Cond{{{Dim: "source", In: in}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.QueryGroups(nil, groups)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSame(t, a, b)
+}
+
 // TestQueryZeroAllocLarge: after a warm-up call populates the pool, an
 // over-capacity query must not allocate on the steady state (pool hit,
 // pre-sized slices, no growth). GC is disabled for the measurement window

@@ -59,6 +59,39 @@ func BenchmarkQueryIndexed1M(b *testing.B) {
 	}
 }
 
+// BenchmarkQueryLargeIn1M runs an indexed equality prefix ("source", the same
+// ~20k-row candidate range as BenchmarkGroupByIndexed1M/BenchmarkQueryAggsDistinct1M)
+// plus a 1024-value IN condition on "country" (a non-index dim, ~200 distinct
+// values in the dataset so the list cycles with repeats — repeats are
+// harmless to both the linear and binary matchIns paths). n=1024 is well over
+// matchIns's 16-value linear-scan threshold, so per-row matching goes through
+// the binary-search path added in Task 4. The candidate range needs to be
+// this wide (not the ~10-row range a source+account prefix leaves): with only
+// a handful of candidate rows, the one-time cost of sorting the 1024-value
+// window at plan time dominates and the O(log n) win never gets to amortize;
+// at ~20k rows the per-row saving (O(n) -> O(log n) per row) dwarfs that
+// fixed sort cost (confirmed by measurement, see the task report).
+func BenchmarkQueryLargeIn1M(b *testing.B) {
+	s := benchStore(b, 1_000_000)
+	buf := make([]float64, 0, 2)
+	in := make([]string, 1024)
+	for i := range in {
+		in[i] = fmt.Sprintf("c%d", i%200)
+	}
+	groups := [][]Cond{
+		{{Dim: "source", Value: "src7"}, {Dim: "country", In: in}},
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var err error
+		buf, err = s.QueryGroups(buf, groups)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkQueryFullScan1M measures the degraded path: "os" is not one of
 // the leading IndexDims, so plan() falls back to a full base scan.
 func BenchmarkQueryFullScan1M(b *testing.B) {

@@ -3,6 +3,7 @@ package facetta
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 )
 
@@ -115,6 +116,13 @@ func (v *view) plan(sc *Schema, g []Cond, p *groupPlan, qs *queryScratch) error 
 				p.dead = true // no listed value exists anywhere
 				return nil
 			}
+			// Sort this window's segment in place: matchIns binary-searches it
+			// for large windows, and Task 5's IN-index expansion needs it
+			// sorted too. anyBase above is already fully computed per-id
+			// during the append loop, so sorting the segment afterward can't
+			// affect it. Duplicate ids (from duplicate input values) stay;
+			// harmless for both linear and binary matching.
+			slices.Sort(qs.inPool[off:len(qs.inPool)])
 			qs.inWins = qs.inWins[:len(qs.inWins)+1]
 			qs.inWins[len(qs.inWins)-1] = inWindow{dim: int32(di), off: int32(off), n: int32(len(qs.inPool) - off)}
 			if !anyBase {
@@ -183,6 +191,15 @@ func (v *view) plan(sc *Schema, g []Cond, p *groupPlan, qs *queryScratch) error 
 	return nil
 }
 
+// inLinearMax is matchIns's linear-scan/binary-search threshold: windows with
+// at most this many candidates are probed linearly (a branchy linear scan
+// beats a binary search's pointer-chasing at this size on real hardware);
+// larger windows binary search instead. Deliberately not tied to
+// fastInConds/fastInIDs (scratch.go) — those bound total query-shape size for
+// stack-vs-pool routing, a different concern; this value is coincidentally
+// also 16.
+const inLinearMax = 16
+
 // matchIns checks a plan's IN conditions against one row's dim ids. ins is a
 // freshly-sliced view built by the caller (qs.inWins[p.insOff:p.insOff+p.insN])
 // and pool is qs.inPool, needed to resolve each window's off/n into actual
@@ -192,21 +209,67 @@ func (v *view) plan(sc *Schema, g []Cond, p *groupPlan, qs *queryScratch) error 
 // rely on that; adding the IN logic (or even a call to it) pushes them over
 // and costs ~20% on the indexed hot path (measured). Call sites short-circuit
 // on p.insN == 0.
+//
+// Every window's pool segment (pool[w.off:w.off+w.n]) is sorted ascending —
+// plan() sorts it once, in place, right after appending it. Per-window
+// matching (both the linear and binary-search paths) is split out into
+// matchOneIn (below), leaving matchIns itself just a loop-and-call: matchIns
+// is inlined at its own queryGroups/QueryAggs/QueryGroupBy call sites (a
+// separate, smaller inlining decision from the matchBase/matchDelta one
+// above), and this split is required to keep it inlinable, not just tidier.
+// Measured with `go build -gcflags='-m -m'`:
+//   - original (pre-binary-search) matchIns: cost 50, under the 80 budget.
+//   - binary-search branch written inline in matchIns directly: cost 134.
+//   - only the large-window (binary) branch extracted to its own
+//     go:noinline function, small-window linear path left inline in
+//     matchIns: cost 126 — still over budget. The real cause is
+//     inlineExtraCallCost (cmd/compile/internal/inline/inl.go): any call to
+//     a function the compiler won't also inline costs 57 against the
+//     budget, REGARDLESS of the callee's own size, precisely to bias
+//     against leaving real (non-inlined) calls in hot inlined code. matchIns
+//     already cost 50 on its own before adding any call, so 50+57=107 alone
+//     exceeds 80 — no amount of shrinking the surrounding branch logic can
+//     claw back 27+ points once a real call is present in matchIns's body.
+//   - both paths (linear AND binary) moved into one go:noinline matchOneIn,
+//     matchIns reduced to a bare "for range ins { call; check }" loop: cost
+//     79, back under budget — the single remaining call still costs its
+//     fixed 57, but the surrounding loop skeleton is cheap enough to fit the
+//     rest of the budget under it. (Getting here also meant passing w by
+//     value and letting matchOneIn do its own off+n slicing internally,
+//     rather than slicing pool in matchIns's own call expression — every
+//     extra node in matchIns's body counts, right down to the last couple
+//     of points.)
 func matchIns(ins []inWindow, pool []uint32, dims [][]uint32, r int) bool {
 	for _, w := range ins {
-		id := dims[w.dim][r]
-		ok := false
-		for _, c := range pool[w.off : w.off+w.n] {
-			if id == c {
-				ok = true
-				break
-			}
-		}
-		if !ok {
+		if !matchOneIn(w, pool, dims[w.dim][r]) {
 			return false
 		}
 	}
 	return true
+}
+
+// matchOneIn checks id against one IN window (w.off/w.n index into pool,
+// sorted ascending): a linear probe for windows no longer than inLinearMax (a
+// branchy linear scan beats a binary search's pointer-chasing at this size
+// on real hardware), a binary search above it (turning an O(n) per-row cost
+// into O(log n)). Deliberately NOT inlined into matchIns — see the comment
+// there for why (the fixed per-call inlining cost means matchIns can afford
+// exactly one such call, not this logic — or even the off+n slice
+// arithmetic — written out in place).
+//
+//go:noinline
+func matchOneIn(w inWindow, pool []uint32, id uint32) bool {
+	seg := pool[w.off : w.off+w.n]
+	if len(seg) <= inLinearMax {
+		for _, c := range seg {
+			if id == c {
+				return true
+			}
+		}
+		return false
+	}
+	_, ok := slices.BinarySearch(seg, id)
+	return ok
 }
 
 // matchRanges checks a plan's range conditions against one row's dim ids,
