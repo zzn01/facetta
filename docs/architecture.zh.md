@@ -44,7 +44,7 @@
 | `snapshot.go` | 424 | 不可变列式基底;全量构建(`buildFromRecords`)与归并(`mergeView`/`zipMerge`) |
 | `view.go` | 227 | `view`/`delta` 结构;写路径 `applyDelta`(copy-on-write) |
 | `store.go` | 193 | `Store` 门面:原子指针、写锁、`Apply`/`Compact`/`ReplaceAll` |
-| `query.go` | 692 | `Cond`(等值/IN/范围),共享规划器(`planGroups`),`QueryGroups`,扫描预算 |
+| `query.go` | 706 | `Cond`(等值/IN/范围),共享规划器(`planGroups`),`QueryGroups`,扫描预算 |
 | `agg.go` | 179 | `Agg`/`AggOp` 聚合选择,`QueryAggs`(零分配) |
 | `groupby.go` | 226 | `QueryGroupBy` 哈希聚合,产出可复用的 `GroupedResult` |
 | `compactor.go` | 89 | 可选后台压实策略(何时调 `Compact`) |

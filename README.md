@@ -128,10 +128,11 @@ Semantics and limits:
   multi-value filter stays indexed instead of degrading to a scan. Expansion
   is budgeted against the cost of a full scan and falls back to one when it
   wouldn't pay off; on the stack fast path it additionally shares a small,
-  fixed interval budget with the rest of the query, so a shape combining
-  several IN-carrying groups is routed to a larger (still zero-allocation
-  in steady state) pooled scratch instead of risking one group's expansion
-  starving another's. `In` has no count limit — values absent from the
+  fixed interval budget with the rest of the query, estimated per group as
+  the *product* of that group's own IN value counts (a cartesian product,
+  not a sum), so a shape combining several IN-carrying groups is routed to a
+  larger (still zero-allocation in steady state) pooled scratch instead of
+  risking one group's expansion starving another's. `In` has no count limit — values absent from the
   table are simply dropped from the set — and `Config.MaxScanRows` is the
   only guard against an expensive shape. See
   [docs/design-rationale.md](docs/design-rationale.md#lifting-the-query-shape-limits)
@@ -215,7 +216,7 @@ deadline needs a lower ceiling — the delta term usually dominates):
 ```go
 store, _ := facetta.New(schema, facetta.Config{
     MaxRows:     5_000_000,
-    MaxScanRows: 10_000, // ≈ 70 µs of base-scan work, refuse anything larger
+    MaxScanRows: 10_000, // ≈ 64 µs of base-scan work, refuse anything larger
 })
 compactor := facetta.NewCompactor(store, facetta.CompactorConfig{
     DeltaRatio:   0.1,
@@ -304,8 +305,8 @@ Measured on an Intel Core i9-9880H (2.30GHz), `go test -bench . -benchmem -run x
 | `BenchmarkQueryIndexed1M` (1M rows, 2 filter groups) | ~470 ns/op | 0 B/op | 0 allocs/op |
 | `BenchmarkQuerySmallIn1M` (indexed prefix + 3-value IN on a non-index dim, linear `matchOneIn`) | ~324 µs/op | 0 B/op | 0 allocs/op |
 | `BenchmarkQueryLargeIn1M` (indexed prefix + 1024-value IN on a non-index dim, binary-search `matchOneIn`) | ~1.05 ms/op | ~84 B/op | 0 allocs/op |
-| `BenchmarkQueryIndexInExpansion1M` (1M rows, 16-value IN on the first index dim, expanded into key intervals) | ~4.5 ms/op | ~0.3 KB/op | 0 allocs/op |
-| `BenchmarkQueryMultiGroupInExpansion1M` (2 groups x 10-value index-dim IN each, pooled routing avoids stack starvation) | ~7.5 ms/op | ~0.5 KB/op | 0 allocs/op |
+| `BenchmarkQueryIndexInExpansion1M` (1M rows, 16-value IN on the first index dim, expanded into key intervals; demand exactly 16 stays on the stack) | ~4.4 ms/op | 0 B/op | 0 allocs/op |
+| `BenchmarkQueryMultiGroupInExpansion1M` (2 groups x 10-value index-dim IN each, product demand 20 routes pooled, avoiding stack starvation) | ~7.4 ms/op | ~0.47 KB/op | 0 allocs/op |
 | `BenchmarkQueryFullScan1M` (1M rows, 1 group on a non-index dim) | ~6.4 ms/op | 0 B/op | 0 allocs/op |
 | `BenchmarkQueryMultiGroup1M` (1M rows, 8 indexed groups unioned) | ~2.1 µs/op | 0 B/op | 0 allocs/op |
 | `BenchmarkQueryWithDelta1M` (1M base + 10k delta, 2 indexed groups) | ~79 µs/op | 0 B/op | 0 allocs/op |
@@ -321,7 +322,7 @@ Measured on an Intel Core i9-9880H (2.30GHz), `go test -bench . -benchmem -run x
 | `BenchmarkCompact1M` (1M base + 1k delta merged per iteration, with dictionary compaction) | ~71 ms/op | ~67 MB/op | ~425 allocs/op |
 | `BenchmarkCompactIDStable1M` (as above on the gated id-stable path, `DictCompactInterval` open) | ~43 ms/op | ~60 MB/op | ~34 allocs/op |
 
-`BenchmarkQueryFullScan1M` shows the degraded full-scan path costs roughly 13,600x an indexed lookup (~6.4 ms vs ~470 ns); `BenchmarkQueryWithDelta1M` shows a 10k-row delta overlay adds ~167x over the delta-free indexed query (~79 µs vs ~470 ns) from its linear scan. `BenchmarkQueryIndexInExpansion1M` shows index-dim IN expansion visiting only the matching sources' rows instead of the full table (~4.5 ms vs full-scan's ~6.4 ms for a set covering under a third of the dimension's cardinality); `BenchmarkQueryMultiGroupInExpansion1M` shows the pooled-routing starvation guard (see [docs/design-rationale.md](docs/design-rationale.md#lifting-the-query-shape-limits)) keeping a 2-group expansion cheap rather than degrading to a full scan. Queries against views with no expirable rows skip all per-row expiry checks (and the clock sample), so tables that never set `ExpireAt` pay nothing for the per-record TTL feature. Base rows are also exempt from per-row checks while the earliest base expiry is still in the future — the expire column is only touched once a row could actually be expired.
+`BenchmarkQueryFullScan1M` shows the degraded full-scan path costs roughly 13,600x an indexed lookup (~6.4 ms vs ~470 ns); `BenchmarkQueryWithDelta1M` shows a 10k-row delta overlay adds ~167x over the delta-free indexed query (~79 µs vs ~470 ns) from its linear scan. `BenchmarkQueryIndexInExpansion1M` shows index-dim IN expansion visiting only the matching sources' rows instead of the full table (~4.4 ms vs full-scan's ~6.4 ms for a set covering under a third of the dimension's cardinality) while staying on the zero-allocation stack path (its demand of exactly 16 fits the budget); `BenchmarkQueryMultiGroupInExpansion1M` shows the pooled-routing starvation guard (see [docs/design-rationale.md](docs/design-rationale.md#lifting-the-query-shape-limits)) keeping a 2-group expansion cheap rather than degrading to a full scan. Queries against views with no expirable rows skip all per-row expiry checks (and the clock sample), so tables that never set `ExpireAt` pay nothing for the per-record TTL feature. Base rows are also exempt from per-row checks while the earliest base expiry is still in the future — the expire column is only touched once a row could actually be expired.
 
 `BenchmarkApply1K` is markedly slower than an earlier measurement of this table (previously ~4.5 ms). This predates the query-shape work above — it reproduces at a comparable magnitude on `feature/typed-dims-range` (the branch this one stacks on, which added `DimInt`/int64 dictionaries) — so it is not introduced by lifting the query-shape limits, which touches only the read path. The number is also noisy in this session, ranging ~7-11 ms/op across 5 runs (median ~11 ms, used above); not investigated further since the root cause sits outside this change's scope. `BenchmarkReplaceAll1M`, by contrast, is a measurement artifact worth flagging rather than a regression: a default single-count run calibrates it to one iteration (`b.N=1`, no in-run averaging), which measured ~1.85 s/op — but `-count=3` recalibrates it to 2-3 iterations and settles at ~481 ms/op, in line with the ~570 ms baseline; the table above uses the corrected, multi-iteration number.
 

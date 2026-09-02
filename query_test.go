@@ -511,17 +511,21 @@ func TestInExpansionIvCapacity(t *testing.T) {
 	}
 }
 
-// TestInExpansionRoomCrossDim pins planExpand's room-exhaustion branch itself
-// (`n > room`), as opposed to TestInExpansionIvCapacity's multi-group
-// starvation, which the pooled-routing guard now avoids entirely: a SINGLE
-// group whose two leading index dims each carry an IN multiplies their
-// candidate counts into a cartesian product, and that product alone can
-// exceed the 16-slot stack budget even though the group count is 1 (so the
-// starvation guard does not reroute it — this shape stays on the stack). The
+// TestInExpansionRoomCrossDim pins the PRODUCT (not sum) nature of
+// queryShape.fits' starvation guard on a SINGLE group: two leading index dims
+// each carrying an IN multiply their candidate counts into a cartesian
+// product (5*5=25) that exceeds the 16-slot stack budget, even though the
+// group count is 1 and the flat INPUT-VALUE sum (5+5=10) looks nowhere near
+// it. A sum-based guard (an earlier, reverted version of this check) would
+// have left this shape on the stack, where planExpand's real combination
+// count (25) exceeds the stack's actual room (16) and the prefix would stop
+// after just one dim; the product-based guard instead routes it to the
+// pooled scratch, whose ample room lets BOTH dims join the prefix. The
 // dataset is large enough that the cost crossover (combos*ceil(log2 N) <= N)
-// never blocks it first, so only the room check does: the prefix expands one
-// dim (source) and stops, and the second IN (account) still applies as a
-// plain row filter rather than being lost.
+// never blocks either dim first, so this pins the routing decision itself,
+// not the crossover. The second IN (account) is checked against only 5 of
+// the dataset's 8 distinct values, so it is still a meaningful filter
+// whether or not it ends up joining the prefix.
 func TestInExpansionRoomCrossDim(t *testing.T) {
 	const nSrc, nAcc, nPub = 5, 8, 100 // 4000 rows: log2 crossover never binds here
 	var recs []Record
@@ -544,8 +548,8 @@ func TestInExpansionRoomCrossDim(t *testing.T) {
 		{Dim: "source", In: []string{"s0", "s1", "s2", "s3", "s4"}},
 		{Dim: "account", In: []string{"a0", "a1", "a2", "a3", "a4"}},
 	}}
-	if !measureShape(groups, 0).fits() {
-		t.Fatal("single-group shape must stay on the stack scratch")
+	if measureShape(groups, 0).fits() {
+		t.Fatal("single-group 5x5 cross-dim product (25) must route to the pooled scratch")
 	}
 	before := s.Stats().FullScans
 	got, err := s.QueryGroups(nil, groups)
@@ -553,10 +557,132 @@ func TestInExpansionRoomCrossDim(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got[0] != want {
-		t.Fatalf("cross-dim room exhaustion: got %v want %v", got[0], want)
+		t.Fatalf("cross-dim product routing: got %v want %v", got[0], want)
 	}
 	if s.Stats().FullScans != before {
-		t.Fatal("room-limited expansion still covers one dim, must not full-scan")
+		t.Fatal("pooled routing must give this shape room to expand, not full-scan")
+	}
+}
+
+// TestInExpansionPerGroupProductDemand pins the exact residual-starvation
+// shape caught in review: one group carrying IN(source,3)*IN(account,4) (a
+// per-group PRODUCT demand of 12) plus a second group carrying IN(source,6)
+// (demand 6). A flat-sum guard reads this as 2 groups + (3+4+6)=13 input
+// values = 15 <= fastIvs(16) and leaves it on the stack, where the first
+// group's actual 12-combination expansion starves the second group's room
+// and degrades it to a full scan. The product-based guard reads it as
+// 12+6=18 > fastIvs(16) and correctly routes it to the pooled scratch, where
+// both groups expand fully. Group 1's source values are disjoint from
+// group 0's, so the union answer is a plain sum of each group's own matches
+// with no overlap to reason about.
+func TestInExpansionPerGroupProductDemand(t *testing.T) {
+	const nSrc, nAcc, nPub = 9, 8, 50 // 3600 rows: log2 crossover never binds here
+	var recs []Record
+	want := 0.0
+	metric := func(si, ai, pi int) float64 { return float64(si*100000 + ai*1000 + pi) }
+	for si := range nSrc {
+		for ai := range nAcc {
+			for pi := range nPub {
+				recs = append(recs, rec(ts(100), []float64{metric(si, ai, pi), 0},
+					fmt.Sprintf("s%d", si), fmt.Sprintf("a%d", ai),
+					fmt.Sprintf("p%d", pi), "c0", "o0"))
+				group0 := si < 3 && ai < 4  // source in {0,1,2} AND account in {0,1,2,3}
+				group1 := si >= 3 && si < 9 // source in {3..8}, any account
+				if group0 || group1 {
+					want += metric(si, ai, pi)
+				}
+			}
+		}
+	}
+	s := replacedStore(t, recs)
+	groups := [][]Cond{
+		{
+			{Dim: "source", In: []string{"s0", "s1", "s2"}},
+			{Dim: "account", In: []string{"a0", "a1", "a2", "a3"}},
+		},
+		{
+			{Dim: "source", In: []string{"s3", "s4", "s5", "s6", "s7", "s8"}},
+		},
+	}
+	if measureShape(groups, 0).fits() {
+		t.Fatal("group0 demand 12 + group1 demand 6 = 18 > fastIvs(16) must route to the pooled scratch")
+	}
+	before := s.Stats().FullScans
+	got, err := s.QueryGroups(nil, groups)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0] != want {
+		t.Fatalf("per-group product demand: got %v want %v", got[0], want)
+	}
+	if s.Stats().FullScans != before {
+		t.Fatal("pooled routing must give both groups room to expand, not full-scan")
+	}
+}
+
+// TestInExpansionPooledRoomExhaustion pins planExpand's OWN interval-capacity
+// check (`n > room`) on the POOLED path — as opposed to every other
+// IN-expansion test here, which either fits comfortably (no check fires) or
+// is now routed away from the stack before planning even starts by
+// queryShape.fits' starvation guard (scratch.go), so this is the one shape in
+// the suite that still reaches that line of code at all.
+//
+// A single group with one IN on "source" listing nearly all of nSrc distinct
+// values (P = nSrc-1, chosen with a comfortable margin over the pooled
+// scratch's own interval budget: cap(qs.ivs) = 1 + expansionIvs = 4097 for a
+// fresh single-group scratch, and P here is ~900 over that so the check
+// still fires even if sync.Pool — shared across the whole test binary —
+// happens to hand back a scratch some other, unrelated test in this package
+// left with a larger retained capacity). nRows is large enough that the
+// OTHER budget (P*ceil(log2 N) <= N) does not block it first: with
+// nSrc=5000, nAcc=25, N=125,000 and ceil(log2 N)=17, P*17 ~= 85,000 <=
+// 125,000, comfortably under. So only the room check can stop this
+// group's expansion, forcing it to a full base scan — MaxScanRows is left
+// at its zero value (Config{}, via replacedStore) precisely so that scan
+// isn't itself refused. The result must stay exactly correct regardless
+// (matchIns is applied to every row either way), and Stats().FullScans must
+// increment by exactly one, pinning that the degrade actually happened
+// rather than the query silently doing something else.
+//
+// Row count (125,000) keeps this comfortably fast (well under a second,
+// scaling from BenchmarkReplaceAll1M's ~481ms/1M-row measurement), so it
+// runs unconditionally rather than being gated behind -short.
+func TestInExpansionPooledRoomExhaustion(t *testing.T) {
+	const nSrc, nAcc = 5000, 25 // 125,000 rows
+	var recs []Record
+	want := 0.0
+	idx := 0
+	for si := 0; si < nSrc; si++ {
+		srcVal := fmt.Sprintf("s%d", si)
+		for ai := 0; ai < nAcc; ai++ {
+			v := float64(idx)
+			idx++
+			recs = append(recs, rec(ts(100), []float64{v, 0},
+				srcVal, fmt.Sprintf("a%d", ai), "p0", "c0", "o0"))
+			if si != 0 { // the IN below excludes s0
+				want += v
+			}
+		}
+	}
+	s := replacedStore(t, recs)
+	in := make([]string, 0, nSrc-1)
+	for si := 1; si < nSrc; si++ {
+		in = append(in, fmt.Sprintf("s%d", si))
+	}
+	groups := [][]Cond{{{Dim: "source", In: in}}}
+	if measureShape(groups, 0).fits() {
+		t.Fatal("a (nSrc-1)-value single-dim IN, well over the pooled scratch's interval budget, must route to the pooled scratch")
+	}
+	before := s.Stats().FullScans
+	got, err := s.QueryGroups(nil, groups)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0] != want {
+		t.Fatalf("pooled interval-capacity exhaustion: got %v want %v", got[0], want)
+	}
+	if s.Stats().FullScans != before+1 {
+		t.Fatal("planExpand's interval-capacity check must still degrade to exactly one counted full scan when even the pool's room runs out")
 	}
 }
 

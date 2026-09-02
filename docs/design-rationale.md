@@ -292,14 +292,32 @@ consume most of it, degrading a later group to a full scan and wasting the
 earlier group's own expansion in the process — the union sweep ends up
 visiting close to the whole table regardless of how selective the first
 group's IN was. Rather than re-deriving the planner's own combination
-accounting just to route the query more precisely, the routing check is
-deliberately pessimistic: any IN-carrying shape whose group count plus total
-IN value count already exceeds the stack's whole interval budget goes
-straight to the pool, whose much larger allowance comfortably serves it.
-Measured on a two-group, ten-value-IN-each shape, this is roughly 2.9x faster
-than leaving it to starve on the stack; the extra pool round trip it costs
-shapes that never needed rerouting is unmeasurable next to those queries' own
-cost.
+accounting just to route the query more precisely, the routing check
+over-approximates instead: it estimates each group's worst-case interval
+demand as the PRODUCT of its own IN conditions' input value counts (planner
+expansion is a cartesian product across a group's covered dims, not a sum),
+sums that estimate across groups, and routes to the pool whenever the total
+exceeds the stack's whole interval budget — the pool's much larger allowance
+comfortably serves it. An earlier version of this check summed every IN
+condition's value count directly instead of taking the per-group product,
+which undercounts: one group carrying two 3- and 4-value index-dim INs needs
+up to 3×4=12 slots, not 3+4=7, so a shape with that group plus a second
+6-value-IN group read as 15 (2 groups + 13 summed values) against the
+16-slot budget and stayed on the stack, where it starved exactly as
+described above — caught in review and fixed to the per-group product. The
+product estimate still over-approximates in two safe directions (it can only
+route a shape to the pool that would have been fine on the stack, never the
+reverse): it multiplies in IN conditions on non-index dims that can never
+actually join the expansion, because the routing check runs before any
+dictionary lookup and has no way to know which dims are index dims yet; and
+it double-counts a second IN condition on a dimension a first IN condition
+already covers, which the planner only ever applies once. Measured on a
+two-group, ten-value-IN-each shape, the corrected guard is roughly 2.9-3x
+faster than leaving it to starve on the stack; the extra pool round trip it
+costs shapes that never needed rerouting is unmeasurable next to those
+queries' own cost — including, now correctly, a single group with a 16-value
+IN on one dim (demand exactly 16, still fits the stack budget and stays
+zero-allocation).
 
 `Cond.Range` deliberately did not follow IN onto the index-prefix path. Index
 keys are packed from dictionary ids, and dictionary ids are assigned in

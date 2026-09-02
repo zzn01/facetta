@@ -21,15 +21,17 @@ const (
 	// degrading that later group to a full scan and wasting the earlier
 	// expansion entirely — measured on a 2-group x 10-value-IN shape
 	// (BenchmarkQueryMultiGroupInExpansion1M) at ~2.9x slower than routing
-	// the same query to the pool. queryShape.fits (below) closes exactly
-	// that starvation case by routing it to the pooled scratch instead,
-	// whose expansionIvs headroom (below) is generous enough that every
-	// group expands fully; the extra pool round trip this costs a shape
-	// that never needed it (e.g. a single group with a 16-value IN,
-	// BenchmarkQueryIndexInExpansion1M) is unmeasurable next to that query's
-	// own cost. Growing fastIvs itself to avoid the reroute was rejected: it
-	// would grow every query's stack frame for a case the pool already
-	// serves at no measurable cost.
+	// the same query to the pool. queryShape.fits (below) closes that
+	// starvation case by routing it to the pooled scratch instead (using a
+	// per-group PRODUCT demand estimate, not a flat sum — see the comment on
+	// fits — since the actual cost of a group is the cartesian product of its
+	// IN conditions' candidate counts, not their sum), whose expansionIvs
+	// headroom (below) is generous enough that every group expands fully;
+	// the extra pool round trip this costs a shape that never needed it
+	// (e.g. a single group with a 16-value IN, BenchmarkQueryIndexInExpansion1M)
+	// is unmeasurable next to that query's own cost. Growing fastIvs itself
+	// to avoid the reroute was rejected: it would grow every query's stack
+	// frame for a case the pool already serves at no measurable cost.
 	fastIvs     = fastGroups
 	fastInConds = 16  // total IN conditions
 	fastInIDs   = 128 // total IN input values
@@ -68,11 +70,55 @@ type rangeWindow struct {
 	min, max int64
 }
 
+// ivDemandCap bounds the per-group product computed by groupIvDemand so it
+// can never overflow int, however many IN conditions (or however large) a
+// single group carries — see groupIvDemand. It only needs to be unambiguously
+// larger than fastIvs; 1<<20 leaves enormous headroom while staying tiny next
+// to int's range.
+const ivDemandCap = 1 << 20
+
+// groupIvDemand estimates the worst-case number of qs.ivs slots one group
+// could expand into: the PRODUCT of its IN conditions' input value counts
+// (planExpand's odometer walks a cartesian product across covered dims, not
+// a sum), clamped to ivDemandCap to avoid overflow. A group with no IN
+// condition needs exactly the one-interval floor. This over-approximates in
+// two ways that are both safe (they can only route a shape to the pool that
+// would have been fine on the stack, never the reverse): it multiplies EVERY
+// IN condition's length in the group, including ones on non-index dims that
+// can never actually join planExpand's prefix (measureShape has no schema
+// here to know which dims are index dims), and it ignores that a second IN
+// on an already-covered dim is skipped rather than multiplied (see
+// planExpand). Both are strict over-counts of the true worst case in the
+// UNCLAMPED regime. Once the running product would exceed ivDemandCap,
+// groupIvDemand gives up computing the true product (which could be
+// astronomically larger and would overflow) and just returns ivDemandCap —
+// that alone is already far enough above fastIvs to route the shape to the
+// pool, and once pooled, planExpand's own `n > room` / log-crossover checks
+// (not this estimate) are what actually bound the planning work; this
+// function's only job is to route correctly, not to compute an exact or even
+// approximate bound once a group is this large.
+func groupIvDemand(g []Cond) int {
+	demand := 1
+	for _, c := range g {
+		if n := len(c.In); n > 0 {
+			if demand > ivDemandCap/n {
+				return ivDemandCap // would overflow or already saturated; already over any real budget
+			}
+			demand *= n
+		}
+	}
+	return demand
+}
+
 // queryShape is the O(input) measure of a query used to route it to the
-// stack or pooled scratch. inVals counts INPUT values (resolved <= input),
-// so routing is deterministic regardless of table contents.
+// stack or pooled scratch. inVals counts INPUT values (resolved <= input);
+// ivDemand is the SUM, across groups, of each group's groupIvDemand (a
+// per-group PRODUCT, not the flat sum inVals is). Both are computed from
+// input counts alone, so routing is deterministic regardless of table
+// contents.
 type queryShape struct {
 	groups, conds, inConds, inVals, ranges, aggs int
+	ivDemand                                     int
 }
 
 func measureShape(groups [][]Cond, nAggs int) queryShape {
@@ -89,25 +135,36 @@ func measureShape(groups [][]Cond, nAggs int) queryShape {
 				sh.conds++
 			}
 		}
+		sh.ivDemand += groupIvDemand(g)
 	}
 	return sh
 }
 
 func (sh queryShape) fits() bool {
 	// Multi-group IN-expansion starvation guard (see the comment on fastIvs):
-	// a shape carrying at least one IN condition, whose group count plus
-	// total IN input values already exceeds the stack's whole interval
-	// budget, is over-approximated straight to the pool rather than risking
-	// an early group's expansion starving a later one on the stack. This is
-	// deliberately pessimistic — sh.inVals doesn't know how many of those
-	// values land on an index dim, or whether several IN conds in one group
-	// would multiply into a cartesian product instead of adding — so it
-	// reroutes some shapes that would have fit fine (measured cost:
-	// unmeasurable, since the pool round trip is nanoseconds against any
-	// query too big to fit fastIvs's 16 slots). Getting this exactly right
-	// would need to replicate planExpand's own combination accounting here,
-	// which is not worth it for a routing decision.
-	if sh.inConds > 0 && sh.groups+sh.inVals > fastIvs {
+	// a shape carrying at least one IN condition, whose total per-group
+	// PRODUCT demand (ivDemand — see groupIvDemand) already exceeds the
+	// stack's whole interval budget, is routed to the pool instead of risking
+	// an early group's expansion starving a later one on the stack.
+	//
+	// This must be the cartesian PRODUCT per group, summed across groups —
+	// not a flat sum of every IN's value count (an earlier version of this
+	// guard used sh.groups+sh.inVals, which undercounts: one group with two
+	// index-dim INs of length 3 and 4 needs up to 3*4=12 slots, not 3+4=7,
+	// so a shape like {IN(dim0,3)+IN(dim1,4)} plus a second group
+	// {IN(dim0,6)} read as 2 groups + 13 values = 15 <= 16 under the old
+	// check and stayed on the stack, while its true demand is 12+6=18 > 16 —
+	// residual starvation, caught in review and fixed here;
+	// TestInExpansionPerGroupProductDemand pins this exact shape).
+	//
+	// ivDemand still over-approximates for the reasons in groupIvDemand's
+	// comment (non-index-dim INs, and a second IN on an already-covered dim),
+	// so this reroutes some shapes that would have fit fine — measured cost:
+	// unmeasurable (BenchmarkQueryIndexInExpansion1M's single-group 16-value
+	// IN has ivDemand exactly 16, so it correctly stays on the stack under
+	// this product-based check, unlike the old sum-based one which
+	// overcounted it as 17 and rerouted it needlessly).
+	if sh.inConds > 0 && sh.ivDemand > fastIvs {
 		return false
 	}
 	return sh.groups <= fastGroups && sh.conds <= fastConds &&

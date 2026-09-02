@@ -54,7 +54,7 @@ Three pillars:
 | `snapshot.go` | 424 | Immutable columnar base; full build (`buildFromRecords`) and merge (`mergeView`/`zipMerge`) |
 | `view.go` | 227 | `view`/`delta` structures; write path `applyDelta` (copy-on-write) |
 | `store.go` | 193 | `Store` facade: atomic pointer, write lock, `Apply`/`Compact`/`ReplaceAll` |
-| `query.go` | 692 | `Cond` (equality/IN/range), shared planner (`planGroups`), `QueryGroups`, scan budget |
+| `query.go` | 706 | `Cond` (equality/IN/range), shared planner (`planGroups`), `QueryGroups`, scan budget |
 | `agg.go` | 179 | `Agg`/`AggOp` aggregate selection, `QueryAggs` (zero-alloc) |
 | `groupby.go` | 226 | `QueryGroupBy` hash aggregation into a reusable `GroupedResult` |
 | `compactor.go` | 89 | Optional background compaction policy (when to call `Compact`) |
