@@ -142,17 +142,23 @@ func BenchmarkQueryIndexInExpansion1M(b *testing.B) {
 	}
 }
 
-// BenchmarkQueryMultiGroupInExpansion1M measures the stack-path starvation
-// case for IN index expansion (see the routing decision on queryShape.fits,
-// scratch.go, and the task report): two groups each carry a 10-value IN on
-// "source", the first index dim. Planned in order, the first group's
-// expansion spends 10 of the stack scratch's 16 interval slots; the second
-// group's reservation (room = cap(ivs) - len(ivs) - reserve) then has too
-// little room for its own 10-combination expansion and falls back to a full
-// scan (see planExpand's cost-crossover check). The union sweep's [0,N)
-// full-scan interval then dominates regardless of the first group's much
-// narrower range, so the whole query ends up costing close to a full table
-// scan even though both groups' IN sets were individually cheap to expand.
+// BenchmarkQueryMultiGroupInExpansion1M measures the shape that used to
+// starve on the stack path before queryShape.fits' per-group product-demand
+// routing guard closed it (scratch.go, and the task report): two groups each
+// carry a 10-value IN on "source", the first index dim, for a total demand
+// of 10+10=20 — over fastIvs(16), so this shape is routed to the pooled
+// scratch and BOTH groups expand fully. Absent that guard, planned in order
+// on the stack, the first group's expansion would spend 10 of the stack
+// scratch's 16 interval slots, the second group's reservation
+// (room = cap(ivs) - len(ivs) - reserve) would then have too little room for
+// its own 10-combination expansion and would fall back to a full scan (see
+// planExpand's cost-crossover check), and the union sweep's [0,N) full-scan
+// interval would dominate regardless of the first group's much narrower
+// range — costing close to a full table scan even though both groups' IN
+// sets were individually cheap to expand. This benchmark measures the
+// guarded, pooled behavior (~7.4ms; the pre-guard, starved-on-stack behavior
+// measured ~22ms in the task report, not reproducible here without reverting
+// the guard).
 func BenchmarkQueryMultiGroupInExpansion1M(b *testing.B) {
 	s := benchStore(b, 1_000_000)
 	buf := make([]float64, 0, 2)

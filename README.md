@@ -80,7 +80,8 @@ share the same planner, union semantics (each row counted once across
 groups) and expiry visibility:
 
 ```go
-// Selected aggregates, still zero-alloc: one output per Agg column.
+// Selected aggregates: one output per Agg column (AggDistinct allocates
+// its per-column id bitmap; the other columns stay allocation-free here).
 sums, err := store.QueryAggs(buf, []facetta.Agg{
     {Op: facetta.AggCount},                       // matched row count
     {Metric: "impressions", Op: facetta.AggSum},
@@ -111,8 +112,11 @@ Semantics and limits:
 - **`QueryAggs`** supports `AggSum`, `AggCount`, `AggMin`, `AggMax`, `AggAvg`
   and `AggDistinct`, with no cap on the number of output columns. Over zero
   matched rows Sum/Count/Distinct are 0 and Min/Max/Avg are **NaN** (the
-  float64 stand-in for SQL NULL). Zero heap allocations, same as
-  `QueryGroups` — except `AggDistinct`.
+  float64 stand-in for SQL NULL). Same allocation contract as `QueryGroups`
+  (zero heap allocations for shapes that fit the stack scratch, amortized
+  zero-alloc for larger shapes on the pooled path) — except `AggDistinct`,
+  which always allocates one id bitmap per column regardless of scratch
+  source.
 - **`AggDistinct`** is an **exact** `COUNT(DISTINCT Dim)`: dictionary
   encoding turns the value set into an id bitmap sized by the dim's known
   cardinality, so each distinct column costs one bitmap allocation

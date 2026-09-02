@@ -603,7 +603,9 @@ func (s *Store) queryClock(v *view) (baseExp, deltaExp bool, nowMilli int64) {
 
 // QueryGroups sums all metrics over rows matching ANY group. dst is reused
 // when cap(dst) >= len(Metrics); the call performs zero heap allocations for
-// query shapes that fit the stack scratch (see queryScratch).
+// query shapes that fit the stack scratch (see queryScratch), and larger
+// shapes borrow a pooled scratch instead, amortized zero-alloc in steady
+// state.
 func (s *Store) QueryGroups(dst []float64, groups [][]Cond) ([]float64, error) {
 	// Routing is inlined here rather than behind a shared helper: see the
 	// comment on scratchBack for why (a shared version isn't inlinable and
@@ -700,7 +702,9 @@ func (s *Store) queryGroups(dst []float64, groups [][]Cond, qs *queryScratch) ([
 
 // Query is the variadic form of QueryGroups: it sums all metrics over rows
 // matching ANY group. dst is reused when cap(dst) >= len(Metrics); the call
-// performs zero heap allocations.
+// performs zero heap allocations for query shapes that fit the stack scratch
+// (see queryScratch), and larger shapes borrow a pooled scratch instead,
+// amortized zero-alloc in steady state.
 func (s *Store) Query(dst []float64, groups ...[]Cond) ([]float64, error) {
 	return s.QueryGroups(dst, groups)
 }

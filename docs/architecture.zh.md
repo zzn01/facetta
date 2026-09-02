@@ -39,14 +39,15 @@
 
 | 文件 | 行数 | 职责 |
 |------|-----:|------|
-| `schema.go` | 161 | `Schema`/`Record`/`Config` 定义与校验,错误哨兵,schema 指纹 |
+| `schema.go` | 167 | `Schema`/`Record`/`Config` 定义与校验,错误哨兵,schema 指纹 |
 | `dict.go` | 103 | 值 ↔ uint32 id 字典:字符串维按拼写为键,整数维按 int64 为键(不存字符串) |
 | `snapshot.go` | 424 | 不可变列式基底;全量构建(`buildFromRecords`)与归并(`mergeView`/`zipMerge`) |
 | `view.go` | 227 | `view`/`delta` 结构;写路径 `applyDelta`(copy-on-write) |
 | `store.go` | 193 | `Store` 门面:原子指针、写锁、`Apply`/`Compact`/`ReplaceAll` |
-| `query.go` | 706 | `Cond`(等值/IN/范围),共享规划器(`planGroups`),`QueryGroups`,扫描预算 |
-| `agg.go` | 179 | `Agg`/`AggOp` 聚合选择,`QueryAggs`(零分配) |
-| `groupby.go` | 226 | `QueryGroupBy` 哈希聚合,产出可复用的 `GroupedResult` |
+| `query.go` | 710 | `Cond`(等值/IN/范围),共享规划器(`planGroups`),`QueryGroups`,扫描预算 |
+| `scratch.go` | 376 | 按查询一份的 scratch:形态测量与栈/池路由、双来源(`scratchBack`/`sync.Pool`)、池化保留门槛、`groupPlan` 等依赖的偏移量+计数/逃逸分析 CAUTION 契约 |
+| `agg.go` | 265 | `Agg`/`AggOp` 聚合选择,`QueryAggs`(栈/池 scratch,稳态摊还零分配;`AggDistinct` 总是分配一张位图) |
+| `groupby.go` | 288 | `QueryGroupBy` 哈希聚合,产出可复用的 `GroupedResult` |
 | `compactor.go` | 89 | 可选后台压实策略(何时调 `Compact`) |
 | `persist.go` | 272 | 快照落盘/加载,版本化二进制格式 + CRC |
 | `stats.go` | 70 | 监控计数器快照 |

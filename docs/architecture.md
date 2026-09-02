@@ -49,14 +49,15 @@ Three pillars:
 
 | File | Lines | Responsibility |
 |------|-----:|------|
-| `schema.go` | 161 | `Schema`/`Record`/`Config` definitions and validation, error sentinels, schema fingerprint |
+| `schema.go` | 167 | `Schema`/`Record`/`Config` definitions and validation, error sentinels, schema fingerprint |
 | `dict.go` | 103 | Value ↔ uint32 id dictionary: spelling-keyed for string dims, int64-keyed (no strings stored) for integer dims |
 | `snapshot.go` | 424 | Immutable columnar base; full build (`buildFromRecords`) and merge (`mergeView`/`zipMerge`) |
 | `view.go` | 227 | `view`/`delta` structures; write path `applyDelta` (copy-on-write) |
 | `store.go` | 193 | `Store` facade: atomic pointer, write lock, `Apply`/`Compact`/`ReplaceAll` |
-| `query.go` | 706 | `Cond` (equality/IN/range), shared planner (`planGroups`), `QueryGroups`, scan budget |
-| `agg.go` | 179 | `Agg`/`AggOp` aggregate selection, `QueryAggs` (zero-alloc) |
-| `groupby.go` | 226 | `QueryGroupBy` hash aggregation into a reusable `GroupedResult` |
+| `query.go` | 710 | `Cond` (equality/IN/range), shared planner (`planGroups`), `QueryGroups`, scan budget |
+| `scratch.go` | 376 | Per-query scratch: shape measurement and stack-vs-pool routing, dual sourcing (`scratchBack`/`sync.Pool`), pooled retention guard, the offset+count/escape-analysis CAUTION contract `groupPlan` and friends rely on |
+| `agg.go` | 265 | `Agg`/`AggOp` aggregate selection, `QueryAggs` (stack/pooled scratch, amortized zero-alloc; `AggDistinct` always allocates a bitmap) |
+| `groupby.go` | 288 | `QueryGroupBy` hash aggregation into a reusable `GroupedResult` |
 | `compactor.go` | 89 | Optional background compaction policy (when to call `Compact`) |
 | `persist.go` | 272 | Snapshot persistence/loading, versioned binary format + CRC |
 | `stats.go` | 70 | Monitoring counter snapshot |

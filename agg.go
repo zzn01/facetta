@@ -118,10 +118,12 @@ func foldAgg(aggs []Agg, mets, ddims []int, acc []float64, bms [][]uint64, first
 
 // QueryAggs computes the requested aggregates over rows matching ANY group
 // (each row counted once, same union semantics as QueryGroups). dst is reused
-// when cap(dst) >= len(aggs); the call performs zero heap allocations, except
-// that each AggDistinct column allocates one id bitmap (O(dim cardinality/64)
-// words). Over zero matched rows Sum, Count and Distinct are 0, and
-// Min/Max/Avg are NaN.
+// when cap(dst) >= len(aggs); the call performs zero heap allocations for
+// query shapes that fit the stack scratch (see queryScratch) — larger shapes
+// borrow a pooled scratch instead, amortized zero-alloc in steady state —
+// except that each AggDistinct column always allocates one id bitmap
+// (O(dim cardinality/64) words), regardless of scratch source. Over zero
+// matched rows Sum, Count and Distinct are 0, and Min/Max/Avg are NaN.
 func (s *Store) QueryAggs(dst []float64, aggs []Agg, groups [][]Cond) ([]float64, error) {
 	// Routing is inlined here rather than behind a shared helper: see the
 	// comment on scratchBack for why.
